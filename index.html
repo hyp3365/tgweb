@@ -97,9 +97,17 @@ a.kb-btn{display:block}
 .seek-feedback.show{opacity:1}
 .modal-box video{width:100%;max-height:80vh;background:#000;border-radius:12px}
 .modal-close{display:block;margin-left:auto;margin-bottom:10px;padding:7px 14px;font-size:14px}
+/* 原生进度条去掉：浏览器自带的 controls 是一整套，没法只关其中一条，
+   只能用 WebKit 的伪元素把时间轴藏起来，播放/音量/全屏这些按钮还在。
+   这招只在 Chrome/Safari 这类 WebKit 浏览器生效，Firefox 不支持这种伪元素，
+   在 Firefox 里原生进度条还会留着——要彻底去掉就得把原生 controls 全拿掉自己重做一套，
+   那就不是“只去掉进度条”了，所以先按这个办法做。 */
+.modal-box video::-webkit-media-controls-timeline{display:none !important}
+.modal-box video::-webkit-media-controls-timeline-container{display:none !important}
 /* 常显进度条：不在视频元素里，是弹窗里单独的一条，所以浏览器自带控制条隐藏时它还在，
-   一直能看到、能点、能拖。其他都不动：原生的播放/音量/全屏按钮还在，双击快进快退还在。 */
-.player-progress{margin-top:10px;user-select:none;-webkit-user-select:none;touch-action:none}
+   一直能看到、能点、能拖。其他都不动：原生的播放/音量/全屏按钮还在，双击快进快退还在。
+   宽度缩短 15%：原来是弹窗满宽，现在是 85% 居中，两边各空 7.5%。 */
+.player-progress{width:85%;margin:10px auto 0;user-select:none;-webkit-user-select:none;touch-action:none}
 .player-progress-track{position:relative;height:24px;display:flex;align-items:center;cursor:pointer}
 .player-progress-bar{position:relative;flex:1;height:6px;background:#333;border-radius:3px}
 .player-progress-buffered{position:absolute;left:0;top:0;height:100%;background:#555;border-radius:3px;width:0%}
