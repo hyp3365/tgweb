@@ -442,8 +442,12 @@ function closePlayer(){
   document.body.style.overflow = '';
 }
 // 双击快进/快退：左半边快退 10 秒，右半边快进 10 秒，中间弹一下提示就消失。
-// 只在视频本身上生效，底部控制条（进度条/音量/全屏按钮）双击不触发，免得点进度条也跳 10 秒。
+// 不只视频框里，播放器黑边区域（视频框外面）双击也一样生效，左右按屏幕中间分。
+// 只有一种情况不触发：双击点在视频本身的底部控制条（进度条/音量/全屏按钮）上，
+// 免得点进度条也跳 10 秒；关闭按钮双击也不触发，点关闭就是关闭。
 // preventDefault 是为了挡住浏览器自带的双击全屏，否则一点双击就全屏了。
+// 注意：监听挂在整个播放器弹窗上，不再只挂视频上，否则视频上的双击会冒泡到弹窗，
+// 一次双击会被算两次，变成 20 秒。
 let seekFeedbackTimer = null;
 function showSeekFeedback(dir){
   const f = document.getElementById('seekFeedback');
@@ -454,13 +458,15 @@ function showSeekFeedback(dir){
   clearTimeout(seekFeedbackTimer);
   seekFeedbackTimer = setTimeout(()=>{ f.classList.remove('show'); }, 700);
 }
-document.getElementById('player').addEventListener('dblclick', e=>{
-  const p = e.currentTarget;
+document.getElementById('playerModal').addEventListener('dblclick', e=>{
+  if (e.target && e.target.closest && e.target.closest('.modal-close')) return;
+  const p = document.getElementById('player');
   e.preventDefault(); e.stopPropagation();
   const r = p.getBoundingClientRect();
-  if (!r.width) return;
-  if (e.clientY > r.bottom - 48) return;
-  const dir = (e.clientX - r.left) < r.width / 2 ? -1 : 1;
+  const insideVideo = r.width && e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+  if (insideVideo && e.clientY > r.bottom - 48) return;
+  const center = insideVideo ? (r.left + r.width / 2) : (window.innerWidth / 2);
+  const dir = e.clientX < center ? -1 : 1;
   let nt = (p.currentTime || 0) + dir * 10;
   if (nt < 0) nt = 0;
   if (isFinite(p.duration) && nt > p.duration) nt = p.duration;
@@ -615,9 +621,16 @@ async function loadChatPage(appendOlder){
       hideChatNewMsgBar();
       window.scrollTo({top:document.body.scrollHeight, behavior:'auto'});
     } else if (d.messages.length) {
+      // 加载更早的消息：新消息在上面，旧位置不动，往上滑就能看到新消息。
+      // 以前是直接跳到最顶，要往下滑一堆才能回到原来的位置，现在锚定原来的位置：
+      // 先记下加载前的页面高度和滚动位置，插完新消息后把滚动位置往下补同样高度，
+      // 这样原来在屏幕上的那条消息还在原地，新消息就在它上面，往上滑就能看到。
+      const oldHeight = document.body.scrollHeight;
+      const oldScrollY = window.scrollY;
       chronological.forEach(m=>chatDisplayedIds.add(m.msg_id));
       box.insertAdjacentHTML('afterbegin', chronological.map(m=>chatBubble(m, currentChatChannelId)).join(''));
-      window.scrollTo({top:0, behavior:'smooth'});
+      const delta = document.body.scrollHeight - oldHeight;
+      window.scrollTo({top: oldScrollY + delta, behavior:'auto'});
     }
     chatHasMore = !!d.has_more;
     chatOldestId = d.next_offset_id || chatOldestId;
@@ -632,7 +645,7 @@ async function loadChatPage(appendOlder){
   chatLoading = false;
 }
 async function loadOlderChat(){ await loadChatPage(true); }
-// 聊天自动刷新：每 5 秒查一次最新消息，不用退出重进就能看到频道/机器人的回复。
+// 聊天自动刷新：每 3 秒查一次最新消息，不用退出重进就能看到频道/机器人的回复。
 // 只在聊天页可见、没在搜消息、没在看视频播放器、页面没切到后台时才查；
 // 查失败不弹窗，下一次再查。已经在屏幕上的消息按 id 去重，不会重复出现。
 // 如果你正在看底部的最新消息，新消息来了就自动滑到底部；
@@ -670,7 +683,7 @@ async function pollNewChatMessages(){
     }
   }catch(e){ /* 静默，下一次再查 */ }
 }
-setInterval(pollNewChatMessages, 5000);
+setInterval(pollNewChatMessages, 3000);
 let chatSearchQ = '';
 let chatSearchOffset = 0;
 let chatSearchHasMore = false;
