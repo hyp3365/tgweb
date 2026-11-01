@@ -8,6 +8,7 @@
 #   tg del            删除 api 配置（清空 api_id / api_hash）
 #   tg reset-password [新密码]  重置网页密码（不给参数就交互输入）
 #   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
+#   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
 #   tg restart        重启服务
 #   tg help           帮助
 # 改完 api_id / api_hash / 删除后会自动重启服务，不用再手动 docker compose。
@@ -66,6 +67,15 @@ mask_hash() {
 }
 
 show_status() {
+  local dom=""
+  if [ -f /etc/nginx/conf.d/tgweb-domain.conf ]; then
+    dom=$(awk '$1=="server_name"{sub(/;$/,"",$2); print $2; exit}' /etc/nginx/conf.d/tgweb-domain.conf 2>/dev/null)
+  fi
+  if [ -n "$dom" ]; then
+    echo "域名：$dom"
+  else
+    echo "域名：未绑定（用 tg domain 绑定）"
+  fi
   if [ ! -f "$ENV_FILE" ]; then
     echo "配置文件不存在：$ENV_FILE"
     echo "api_id：未配置"
@@ -168,6 +178,19 @@ do_del() {
   restart_service
 }
 
+do_domain() {
+  local script=""
+  if [ -f "$APP_DIR/tg-domain.sh" ]; then
+    script="$APP_DIR/tg-domain.sh"
+  elif [ -f /usr/local/bin/tg-domain ]; then
+    script="/usr/local/bin/tg-domain"
+  else
+    echo "找不到域名工具 tg-domain.sh，请先用一键安装重新装一次。"
+    return 1
+  fi
+  bash "$script" "$@"
+}
+
 show_help() {
   echo "tg - 视频库服务器快捷命令"
   echo "  tg              交互菜单"
@@ -177,6 +200,7 @@ show_help() {
   echo "  tg del          删除 api 配置"
   echo "  tg reset-password [新密码]  重置网页密码"
   echo "  tg show-password  查看当前网页密码"
+  echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
   echo "  tg restart      重启服务"
   echo "  tg help         帮助"
 }
@@ -193,8 +217,9 @@ menu() {
     echo "4) 重置网页密码"
     echo "5) 查看网页密码"
     echo "6) 重启服务"
+    echo "7) 绑定/更换域名"
     echo "0) 退出"
-    read -r -p "选一个 [0-6]： " choice
+    read -r -p "选一个 [0-7]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -222,12 +247,15 @@ menu() {
       6)
         restart_service
         ;;
+      7)
+        do_domain
+        ;;
       0|"")
         echo "退出。"
         break
         ;;
       *)
-        echo "没有这个选项，选 0-6。"
+        echo "没有这个选项，选 0-7。"
         ;;
     esac
   done
@@ -240,6 +268,7 @@ case "${1:-}" in
   del) do_del ;;
   reset-password|reset-pw) do_reset_web_password "${2:-}" ;;
   show-password|view-password|show-pw|view-pw) show_web_password ;;
+  domain) do_domain "${@:2}" ;;
   restart) restart_service ;;
   help|-h|--help) show_help ;;
   "") menu ;;

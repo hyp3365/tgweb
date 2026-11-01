@@ -39,9 +39,11 @@ else
   git clone "$REPO" "$DIR"
 fi
 
-# 装 tg 快捷命令
+# 装 tg 快捷命令和域名工具
 cp "$DIR/tg" /usr/local/bin/tg
 chmod +x /usr/local/bin/tg
+cp "$DIR/tg-domain.sh" /usr/local/bin/tg-domain
+chmod +x /usr/local/bin/tg-domain
 # tg 默认目录就是 /root/telegram-stream；装到别的目录时用 TG_APP_DIR 指向它
 if [ "$DIR" != "/root/telegram-stream" ]; then
   echo "注意：tg 默认目录是 /root/telegram-stream，你装在 $DIR，请用 TG_APP_DIR=$DIR tg"
