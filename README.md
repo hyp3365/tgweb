@@ -16,6 +16,8 @@ tg reset-password [新密码]
 tg show-password
 tg reset-path
 tg show-path
+tg set-parallel [1-4]
+tg show-parallel
 tg domain [域名]
 tg uninstall
 tg restart

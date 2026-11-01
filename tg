@@ -10,6 +10,8 @@
 #   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
 #   tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字路径）
 #   tg show-path      查看当前访问路径和完整地址（只在服务器终端显示）
+#   tg set-parallel [1-4]  设置并行下载数（默认 2，最大 4）
+#   tg show-parallel  查看当前并行下载数
 #   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
 #   tg uninstall      全部卸载（会提示输入 yes 确认）
 #   tg restart        重启服务
@@ -102,6 +104,13 @@ show_status() {
     echo "api_id：$id"
   fi
   echo "api_hash：$(mask_hash "$hash")"
+  local par
+  par="$(get_val TG_PARALLEL)"
+  if [ -z "$par" ]; then
+    echo "并行下载数：2（默认）"
+  else
+    echo "并行下载数：$par"
+  fi
   if [ -f "$APP_DIR/data/tg.session" ]; then
     echo "登录 session：已存在（data/tg.session）"
     _mode="$(stat -c %a "$APP_DIR/data/tg.session" 2>/dev/null || echo "?")"
@@ -255,6 +264,32 @@ do_reset_web_password() {
   restart_service
 }
 
+show_parallel() {
+  local par
+  par="$(get_val TG_PARALLEL)"
+  if [ -z "$par" ]; then
+    echo "并行下载数：2（默认）"
+  else
+    echo "并行下载数：$par"
+  fi
+  echo "说明：1 就是单连接（改之前那样），2 默认，全局最多 4，再多容易被 Telegram 限流。"
+}
+
+do_set_parallel() {
+  local n="$1"
+  if [ -z "$n" ]; then
+    read -r -p "并行下载数（1-4，默认 2）： " n
+    if [ -z "$n" ]; then n="2"; fi
+  fi
+  if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt 4 ]; then
+    echo "并行下载数只能是 1-4，默认 2，超过 4 不接受。"
+    return 1
+  fi
+  set_val TG_PARALLEL "$n"
+  echo "并行下载数已设为 $n，重启后生效。"
+  restart_service
+}
+
 do_del() {
   set_val TG_API_ID "0"
   set_val TG_API_HASH "placeholder"
@@ -331,6 +366,8 @@ show_help() {
   echo "  tg show-password  查看当前网页密码"
   echo "  tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字）"
   echo "  tg show-path      查看当前访问路径和完整地址"
+  echo "  tg set-parallel [1-4]  设置并行下载数（默认 2，最大 4）"
+  echo "  tg show-parallel  查看当前并行下载数"
   echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
   echo "  tg uninstall    全部卸载（会提示输入 yes 确认）"
   echo "  tg restart      重启服务"
@@ -359,8 +396,9 @@ menu() {
     echo "8) 卸载（全部删除）"
     echo "9) 重置访问路径"
     echo "10) 查看访问路径"
+    echo "11) 设置并行下载数（1-4，默认 2）"
     echo "0) 退出"
-    read -r -p "选一个 [0-10]： " choice
+    read -r -p "选一个 [0-11]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -397,6 +435,9 @@ menu() {
       10)
         show_web_path
         ;;
+      11)
+        do_set_parallel ""
+        ;;
       8)
         do_uninstall
         if [ $? -eq 0 ]; then
@@ -409,11 +450,11 @@ menu() {
         break
         ;;
       *)
-        echo "没有这个选项，选 0-10。"
+        echo "没有这个选项，选 0-11。"
         ;;
     esac
     case "$choice" in
-      1|2|3|4|5|6|7|8|9|10)
+      1|2|3|4|5|6|7|8|9|10|11)
         pause_for_key
         ;;
     esac
@@ -429,6 +470,8 @@ case "${1:-}" in
   show-password|view-password|show-pw|view-pw) show_web_password ;;
   reset-path) do_reset_web_path "${2:-}" ;;
   show-path|view-path|show-p) show_web_path ;;
+  set-parallel) do_set_parallel "${2:-}" ;;
+  show-parallel|view-parallel) show_parallel ;;
   domain) do_domain "${@:2}" ;;
   uninstall) do_uninstall "${2:-}" ;;
   restart) restart_service ;;

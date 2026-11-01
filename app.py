@@ -27,6 +27,22 @@ SESSION_PATH = os.environ.get("TG_SESSION", "data/tg.session")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 WEB_PATH = os.environ.get("WEB_PATH", "").strip().strip("/")
 WEB_SESSION_DAYS = 30
+
+
+def _clamp_parallel(v):
+    try:
+        n = int(v)
+    except Exception:
+        return 2
+    return max(1, min(4, n))
+
+
+# 并行下载数：全局设置，默认 2，tg set-parallel 最多改到 4（再多容易 FloodWait）。
+# 读启动时的环境变量，改完要重启容器才生效，和 WEB_PASSWORD / WEB_PATH 一样。
+PARALLEL = _clamp_parallel(os.environ.get("TG_PARALLEL", "2"))
+# 全局并发下载任务封顶也是 4：一个视频用满 4 个时，别的视频要等当前窗口放出名额，
+# 避免多个视频同时播时总并发超标。缩略图/图片是小文件单次下载，不占这个名额，否则 30 张图会把视频饿死。
+_download_sem = asyncio.Semaphore(4)
 _web_sessions: dict = {}  # token -> expiry timestamp，cookie 本身不再是密码的哈希，泄露也推不出密码
 _web_attempts: dict = {}  # ip -> [失败时间戳]，10 分钟内 5 次失败就限流 10 分钟
 _client_lock = asyncio.Lock()
@@ -985,8 +1001,93 @@ def _parse_range(range_header: str | None, total: int):
 # 只在本来就要下载 >=512KB 的请求里顺带攒满 512KB 才存，小探测（2 字节）不会为了攒缓存多下 Telegram 的流量，
 # 也不会用 2 字节的头把之前攒好的 512KB 覆盖掉。
 _HEAD_SIZE = 512 * 1024
-_RANGE_CAP = 4 * 1024 * 1024
+_RANGE_CAP = 16 * 1024 * 1024
+_CHUNK = 512 * 1024  # Telethon 的 request_size 默认就是 512KB，对齐这个尺寸下才不浪费
 _head_cache = _BytesLRU(50 * 1024 * 1024)
+
+
+async def _download_one_chunk(client, media, total, chunk_start, chunk_len):
+    # 只取一个 512KB 对齐块：调用方保证 chunk_start 是 512KB 倍数（首块除外，首块在调用方对齐后自己裁掉前面的 skip），
+    # 这样 Telethon 不用走 Generic 的“每块多下 512KB 再裁”路线，实测单连接几百 KB/s 时这点很关键。
+    # 全局信号量在这里拿：4 个任务占满时，后来的窗口要等，不会无限制并发去撞 FloodWait。
+    # 取完第一块必须 close 迭代器：不同 DC 时它会借一个 exported sender，不还回去会越借越多。
+    async with _download_sem:
+        it = client.iter_download(media, offset=chunk_start, file_size=total)
+        try:
+            async for chunk in it:
+                return chunk[:chunk_len]
+            return b""
+        finally:
+            close = getattr(it, "close", None)
+            if close is not None:
+                try:
+                    res = close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
+
+async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_id=None):
+    # 按 512KB 对齐块并行下，窗口 = 并行数 × 512KB（默认 2 → 1MB 窗口，改到 4 → 2MB 窗口），
+    # 窗口内各块并发下、按顺序回，内存最多只占一个窗口，不会把整文件先缓冲完。
+    # 起点不对齐时：先从对齐起点下首块、自己裁掉前面的 skip，只浪费首块前面不到 512KB，
+    # 后面所有块都是对齐的，不会像直接把不对齐起点交给 Telethon 那样每块都多下 512KB。
+    # 浏览器断开/拖进度时，生成器被取消，当前窗口没下完的任务一并取消，不会继续白下 Telegram 的流量。
+    aligned_start = (start // _CHUNK) * _CHUNK
+    skip = start - aligned_start
+    cur = aligned_start
+    first = True
+    head_buf = bytearray()
+    while cur <= end:
+        window_end = min(cur + PARALLEL * _CHUNK - 1, end)
+        # 本窗口的块：首块可能要从对齐起点下整块再裁 skip，其余块按 512KB 切
+        specs = []
+        p = cur
+        while p <= window_end:
+            # 首块的下载长度：从对齐起点到请求终点（不超过一整块），调用方再裁掉前面的 skip；
+            # 其余块就是本块在请求范围内的长度（最后一块可能不足 512KB）。
+            # 注意不能用 total-p：小范围（比如 Safari 0-1 探测）终点就在首块内，用 total 会多回一整块，超 Content-Length。
+            if first and p == aligned_start:
+                dl_len = min(_CHUNK, end - aligned_start + 1)
+            else:
+                dl_len = min(_CHUNK, end - p + 1)
+            specs.append((p, dl_len))
+            p += _CHUNK
+        tasks = [asyncio.create_task(_download_one_chunk(client, media, total, s, l)) for s, l in specs]
+        try:
+            for idx, task in enumerate(tasks):
+                data = await task
+                if not data:
+                    break
+                if first and idx == 0 and skip:
+                    data = data[skip:]
+                    if not data:
+                        continue
+                if start == 0 and first and idx == 0 and channel_id is not None:
+                    # 起点是 0 时首块就是头缓存：只有攒满 512KB（或文件本身不足 512KB）才存，
+                    # 小探测不会把 2 字节的头存进去覆盖旧的
+                    head_buf.extend(data[:_HEAD_SIZE - len(head_buf)])
+                    if len(head_buf) >= _HEAD_SIZE or len(head_buf) == total:
+                        _head_cache.put((channel_id, msg_id), bytes(head_buf))
+                yield data
+                if len(data) == 0:
+                    break
+            else:
+                # 本窗口完整下完才进下一窗口；中途 data 为空 break 时直接结束，不再继续要后面的窗口
+                cur = window_end + 1
+                first = False
+                continue
+            break
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            raise
+        except Exception:
+            for t in tasks:
+                t.cancel()
+            raise
+    return
 
 
 @app.get("/stream/{channel_id}/{msg_id}")
@@ -1007,8 +1108,8 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
     if parsed is None:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
     start, end = parsed
-    # 开放式 Range（bytes=X-，不是后缀 bytes=-N、不是闭合 bytes=X-Y、不是无 Range）才封顶 4MB：
-    # 拖进度、关播放器时旧请求不用等发现断开才停，最多白费 4MB；浏览器拿到 206 + 真实 Content-Range 后
+    # 开放式 Range（bytes=X-，不是后缀 bytes=-N、不是闭合 bytes=X-Y、不是无 Range）才封顶 16MB：
+    # 拖进度、关播放器时旧请求不用等发现断开才停，最多白费 16MB；浏览器拿到 206 + 真实 Content-Range 后
     # 需要更多数据时会自己接着要下一段，播放不受影响。无 Range 的整文件请求不封顶，否则直接下载会被截断。
     if range_header and re.fullmatch(r"bytes=\d+-", range_header.strip()):
         end = min(end, start + _RANGE_CAP - 1)
@@ -1027,46 +1128,24 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
             if range_header:
                 return Response(content=data, status_code=206, media_type=mime, headers=headers)
             return Response(content=data, media_type=mime, headers=headers)
-        # 头只覆盖前半段：先回缓存的头，再从 Telegram 接着拉剩余部分
+        # 头只覆盖前半段：先回缓存的头，再从 Telegram 并行拉剩余部分（剩余起点 512KB 对齐，正好走并行快路）
         cached_part = head[start:]
         remainder_start = len(head)
-        remainder_length = length - len(cached_part)
 
         async def gen_cached():
             yield cached_part
-            remaining = remainder_length
-            async for chunk in client.iter_download(media, offset=remainder_start, file_size=total):
-                if remaining <= 0:
-                    break
-                chunk = chunk[:remaining]
-                remaining -= len(chunk)
+            async for chunk in _parallel_gen(client, media, total, remainder_start, end):
                 yield chunk
 
         return StreamingResponse(gen_cached(), status_code=206 if range_header else 200,
                                  media_type=mime, headers=headers)
 
-    async def gen():
-        # Telethon 的 limit 是分块数，不是字节数，传 limit=length 会一直下到文件末尾，
-        # 发出的数据比 Content-Length 多，uvicorn 会断开；Safari 发 bytes=0-1 探测时尤其明显。
-        # 这里不传 limit，按字节截断，剩 0 就停。
-        remaining = length
-        head_buf = bytearray()
-        head_stored = False
-        async for chunk in client.iter_download(media, offset=start, file_size=total):
-            if remaining <= 0:
-                break
-            chunk = chunk[:remaining]
-            remaining -= len(chunk)
-            yield chunk
-            if start == 0 and not head_stored and len(head_buf) < _HEAD_SIZE:
-                head_buf.extend(chunk[:_HEAD_SIZE - len(head_buf)])
-                if len(head_buf) >= _HEAD_SIZE or (remaining == 0 and len(head_buf) == total):
-                    _head_cache.put((channel_id, msg_id), bytes(head_buf))
-                    head_stored = True
-
+    # 正常路径也走并行：单连接只有几百 KB/s，并行 2 默认就能翻倍左右，改到 4 最多翻 4 倍（受 Telegram 单连接限速和服务器带宽制约）。
+    # 注意 Content-Length 还是按 length 算，并行生成器保证回的字节数正好是 length，不多不少。
+    gen = _parallel_gen(client, media, total, start, end, channel_id=channel_id, msg_id=msg_id)
     if range_header:
-        return StreamingResponse(gen(), status_code=206, media_type=mime, headers=headers)
-    return StreamingResponse(gen(), media_type=mime, headers=headers)
+        return StreamingResponse(gen, status_code=206, media_type=mime, headers=headers)
+    return StreamingResponse(gen, media_type=mime, headers=headers)
 
 
 @app.get("/")

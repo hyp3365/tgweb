@@ -17,3 +17,4 @@ services:
       TG_SESSION: "data/tg.session"
       WEB_PASSWORD: "${WEB_PASSWORD:-}"
       WEB_PATH: "${WEB_PATH:-}"
+      TG_PARALLEL: "${TG_PARALLEL:-2}"
