@@ -714,6 +714,15 @@ def _video_info(msg):
     # 很多频道视频本身就没有说明文字，之前只取说明文字，所以看起来“没有名字”
     caption = (msg.text or "").strip()
     title = caption[:120] if caption else (filename[:120] if filename else None)
+    replies_obj = getattr(msg, "replies", None)
+    replies_count = 0
+    has_comments = False
+    if replies_obj is not None:
+        try:
+            replies_count = int(getattr(replies_obj, "replies", 0) or 0)
+            has_comments = bool(getattr(replies_obj, "channel_id", None))
+        except Exception:
+            pass
     return {"msg_id": msg.id,
             "title": title,
             "caption": caption[:120],
@@ -722,7 +731,9 @@ def _video_info(msg):
             "size": doc.size,
             "mime": doc.mime_type or "video/mp4",
             "duration": duration,
-            "has_thumb": bool(getattr(doc, "thumbs", None))}
+            "has_thumb": bool(getattr(doc, "thumbs", None)),
+            "replies": replies_count,
+            "has_comments": has_comments}
 
 
 @app.get("/api/videos")
@@ -901,7 +912,22 @@ def _message_info(msg):
             sender_is_user = False
     elif getattr(msg, "post_author", None):
         sender_name = msg.post_author
+    # 评论：频道帖子的评论不在频道本身，在关联的讨论组里。
+    # msg.replies 就是 Telegram 给的评论信息：replies 是条数，channel_id 是讨论组 id，
+    # 没有就是 0 / 没有评论区，前端只在有评论区时才显示“查看评论”按钮。
+    replies_obj = getattr(msg, "replies", None)
+    replies_count = 0
+    has_comments = False
+    if replies_obj is not None:
+        try:
+            replies_count = int(getattr(replies_obj, "replies", 0) or 0)
+            has_comments = bool(getattr(replies_obj, "channel_id", None))
+        except Exception:
+            replies_count = 0
+            has_comments = False
     return {"msg_id": msg.id,
+            "replies": replies_count,
+            "has_comments": has_comments,
             "kind": kind,
             "text": (msg.text or "")[:2000],
             "date": msg.date.isoformat() if msg.date else None,
@@ -940,6 +966,83 @@ async def messages(request: Request, channel_id: int, limit: int = 30, offset_id
     # 返回最新在前，前端聊天页翻转成从旧到新显示
     return {"messages": out, "has_more": has_more,
             "next_offset_id": out[-1]["msg_id"] if has_more and out else None}
+
+
+async def _discussion_info(client, channel_id, msg_id, username=None):
+    # 找帖子的讨论组：先取原帖，再用 Telethon 的 GetDiscussionMessage 拿到讨论组 peer
+    # 和原帖在讨论组里的那条镜像消息 id，评论就是回复那条镜像消息的消息。
+    # _get_comment_data 是 Telethon 内部方法（1.45 里有），没有公开的取评论接口，
+    # 所以直接用它，失败就当没有评论区处理，不让整个页面报错。
+    msg = await _get_message(client, channel_id, msg_id, username)
+    if msg is None:
+        return None
+    entity = await _channel_entity(client, channel_id, username)
+    try:
+        peer, disc_msg_id = await client._get_comment_data(entity, msg)
+    except Exception:
+        return None
+    disc_channel_id = getattr(peer, "channel_id", None)
+    return (peer, disc_msg_id, disc_channel_id, msg)
+
+
+@app.get("/api/comments")
+async def comments(request: Request, channel_id: int, msg_id: int, limit: int = 30, offset_id: int = 0, username: str | None = None):
+    check_web_auth(request)
+    client = await require_login()
+    limit = max(1, min(limit, 100))
+    disc = await _discussion_info(client, channel_id, msg_id, username)
+    if disc is None:
+        raise HTTPException(status_code=404, detail="这个帖子没有评论区")
+    peer, disc_msg_id, disc_channel_id, _orig = disc
+    out = []
+    async for msg in client.iter_messages(peer, reply_to=disc_msg_id, limit=limit + 1, offset_id=offset_id):
+        if disc_channel_id:
+            _cache_msg(disc_channel_id, msg)
+        info = _message_info(msg)
+        if info:
+            out.append(info)
+        if len(out) > limit:
+            break
+    has_more = len(out) > limit
+    if has_more:
+        out = out[:limit]
+    return {"messages": out, "has_more": has_more,
+            "next_offset_id": out[-1]["msg_id"] if has_more and out else None,
+            "discussion_channel_id": disc_channel_id,
+            "discussion_msg_id": disc_msg_id}
+
+
+class CommentIn(BaseModel):
+    channel_id: int
+    msg_id: int
+    text: str
+    username: str | None = None
+
+
+@app.post("/api/comment")
+async def post_comment(request: Request, body: CommentIn):
+    check_web_auth(request)
+    client = await require_login()
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="评论不能为空")
+    disc = await _discussion_info(client, body.channel_id, body.msg_id, body.username)
+    if disc is None:
+        raise HTTPException(status_code=404, detail="这个帖子没有评论区")
+    peer, disc_msg_id, disc_channel_id, _orig = disc
+    try:
+        sent = await client.send_message(peer, text, reply_to=disc_msg_id)
+    except Exception as e:
+        name = type(e).__name__
+        msg = str(e)
+        if "WriteForbidden" in name or "WRITE_FORBIDDEN" in msg or "CHAT_WRITE_FORBIDDEN" in msg:
+            raise HTTPException(status_code=403, detail="这个讨论组不允许发言")
+        if "AdminRequired" in name or "ADMIN" in msg:
+            raise HTTPException(status_code=403, detail="这个讨论组不允许发言，需要权限")
+        raise HTTPException(status_code=400, detail=f"评论发送失败：{msg[:200]}")
+    if disc_channel_id:
+        _cache_msg(disc_channel_id, sent)
+    return {"ok": True, "message": _message_info(sent), "discussion_channel_id": disc_channel_id}
 
 
 @app.get("/api/search-messages")

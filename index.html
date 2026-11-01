@@ -104,6 +104,12 @@ a.kb-btn{display:block}
    这样播放器框底边和按钮之间总有空隙，按钮不会压住进度条的时间文字。 */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px}
 .modal-box{width:100%;max-width:1600px;position:relative}
+/* 单手用手机时：播放器沉到底部，进度条就在拇指附近，不用够到屏幕中间去拖。
+   只在触屏或窄屏上这样，电脑鼠标能轻松点中间，电脑上还是居中，不会变得很怪。
+   底部 64px 的空还是给关闭按钮留的，进度条不会被按钮压住。 */
+@media (pointer: coarse), (max-width: 768px) {
+  .modal{align-items:flex-end}
+}
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
 .modal-box video{width:100%;max-height:80vh;background:#000;border-radius:12px}
@@ -242,6 +248,25 @@ a.kb-btn{display:block}
   </div>
 </div>
 
+<!-- 评论：频道帖子的评论不在频道里，在关联的讨论组里，这里就是把讨论组里的回复拉出来看和发 -->
+<div id="commentsView" class="hidden">
+  <div class="chat-wrap">
+  <div class="sticky-header">
+    <button class="back-btn" onclick="backFromComments()">← 返回</button>
+    <h2 id="commentsTitle">评论</h2>
+  </div>
+  <div id="commentOrig" class="muted" style="padding:8px 10px"></div>
+  <div id="commentLoadMoreWrap" class="hidden" style="text-align:center;margin:10px 0">
+    <button id="commentLoadMoreBtn" onclick="loadOlderComments()">加载更早的评论</button>
+  </div>
+  <div id="commentMessages"></div>
+  <div class="chat-input-row">
+    <input id="commentInput" placeholder="输入评论…">
+    <button onclick="sendComment()">发送</button>
+  </div>
+  </div>
+</div>
+
 </div>
 </div>
 
@@ -298,7 +323,7 @@ function showApp(){
   document.getElementById('app').classList.remove('hidden');
 }
 function showView(name){
-  ['loginView','channelsView','channelView','checkingView','chatView'].forEach(id=>{
+  ['loginView','channelsView','channelView','checkingView','chatView','commentsView'].forEach(id=>{
     document.getElementById(id).classList.toggle('hidden', id !== name);
   });
 }
@@ -653,11 +678,12 @@ function videoCards(videos, channelId){
     const thumb = v.has_thumb
       ? `<img src="${WEB_BASE}/thumb/${channelId}/${v.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
       : `<div class="thumb-placeholder">▶</div>`;
+    const commentBtn = v.has_comments ? `<button onclick="event.stopPropagation();openComments(${channelId},${v.msg_id})" style="margin-left:6px;padding:6px 10px;font-size:13px">💬 评论${v.replies ? ' (' + v.replies + ')' : ''}</button>` : '';
     return `<div class="video-card">
      <div class="thumb" onclick="playVideo(${channelId},${v.msg_id})">${thumb}<span class="dur">${fmtDur(v.duration)}</span></div>
      <div class="video-body"><div class="video-title">${title}</div>
      <span class="muted">${v.date?new Date(v.date).toLocaleString():''} · ${fmtSize(v.size)}</span><br>
-     <button onclick="playVideo(${channelId},${v.msg_id})">播放</button></div></div>`;
+     <button onclick="playVideo(${channelId},${v.msg_id})">播放</button>${commentBtn}</div></div>`;
   }).join('');
 }
 async function loadVideoPage(append){
@@ -749,13 +775,14 @@ function chatDateSepHtml(key){
 }
 // 按时间顺序的消息列表，中间按天插日期分隔；skipFirstDate 是上一批最后一天，
 // 那天已经有分隔了就不再重复插一个（轮询和发消息时用，初始加载传空）
-function chatListHtml(messages, skipFirstDate){
+function chatListHtml(messages, skipFirstDate, channelId, usernameOverride){
+  const cid = channelId || currentChatChannelId;
   let html = '';
   let lastDate = skipFirstDate || null;
   messages.forEach(m=>{
     const k = chatDateKey(m.date);
     if (k && k !== lastDate) { html += chatDateSepHtml(k); lastDate = k; }
-    html += chatBubble(m, currentChatChannelId);
+    html += chatBubble(m, cid, usernameOverride);
   });
   return html;
 }
@@ -769,13 +796,17 @@ function dedupeDateSeps(box){
     else seen = d;
   });
 }
-function chatBubble(m, channelId){
+function chatBubble(m, channelId, usernameOverride){
+  // 评论页传 usernameOverride=''：头像/图片地址不带原频道用户名，
+  // 后端按讨论组 id 用 PeerChannel 兜底解析，带原频道用户名反而会解析到原频道，拿错消息。
+  const uname = usernameOverride !== undefined ? usernameOverride : currentChannelUsername;
+  const unameQ = uname ? `?username=${encodeURIComponent(uname)}` : '';
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
-  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}"${m.pw && m.ph ? ` width="${m.pw}" height="${m.ph}"` : ''} loading="lazy" alt="">`;
+  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${unameQ}"${m.pw && m.ph ? ` width="${m.pw}" height="${m.ph}"` : ''} loading="lazy" alt="">`;
   if (m.kind === 'video') {
     const thumb = m.has_thumb
-      ? `<img src="${WEB_BASE}/thumb/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
+      ? `<img src="${WEB_BASE}/thumb/${channelId}/${m.msg_id}${unameQ}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
       : `<div class="thumb-placeholder">▶</div>`;
     body += `<div class="chat-thumb" onclick="playVideo(${channelId},${m.msg_id})">${thumb}<span class="dur">${fmtDur(m.duration)}</span></div><button onclick="playVideo(${channelId},${m.msg_id})" style="margin-top:6px;padding:6px 12px;font-size:13px">播放视频</button>`;
   }
@@ -788,12 +819,15 @@ function chatBubble(m, channelId){
       return `<button class="kb-btn" onclick="clickInlineBtn(${channelId},${m.msg_id},${ri},${ci})">${esc(b.text)}</button>`;
     }).join('') + `</div>`).join('') + `</div>`;
   }
+  if (m.has_comments) {
+    body += `<div style="margin-top:8px"><button onclick="openComments(${channelId},${m.msg_id})" style="padding:6px 12px;font-size:13px">💬 查看评论${m.replies ? ' (' + m.replies + ')' : ''}</button></div>`;
+  }
   const isOwn = !!m.out;
   const showSender = !isOwn && m.sender_is_user && m.sender_name;
   const color = senderColor(m.sender_id);
   const initial = showSender ? esc(String(m.sender_name).trim().charAt(0).toUpperCase() || '?') : '?';
   const avatar = showSender
-    ? `<div class="chat-avatar" style="background:${color}"><span>${initial}</span><img src="${WEB_BASE}/avatar/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.style.display='none'"></div>`
+    ? `<div class="chat-avatar" style="background:${color}"><span>${initial}</span><img src="${WEB_BASE}/avatar/${channelId}/${m.msg_id}${unameQ}" loading="lazy" alt="" onerror="this.style.display='none'"></div>`
     : '';
   const nameHtml = showSender ? `<div class="chat-sender" style="color:${color}">${esc(m.sender_name)}</div>` : '';
   const timeHtml = `<div class="chat-time">${chatTimeStr(m.date)}</div>`;
@@ -993,6 +1027,85 @@ async function sendChatMessage(){
   }catch(e){ alert(e.message); }
 }
 document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChatMessage(); });
+
+// 评论页：原帖在频道，评论在讨论组，后端按原帖找到讨论组再按回复取评论。
+// 评论本身也是消息，所以直接复用聊天页的气泡（头像、名字、时间、图片、视频、按钮都在），
+// 只是评论的头像/图片地址要用讨论组 id，不是原频道 id，后端会把 discussion_channel_id 一起返回。
+let commentChannelId = null;
+let commentMsgId = null;
+let commentDiscChannelId = null;
+let commentOldestId = 0;
+let commentHasMore = false;
+let commentReturnTo = 'chatView';
+async function openComments(channelId, msgId){
+  commentChannelId = channelId;
+  commentMsgId = msgId;
+  commentDiscChannelId = null;
+  commentOldestId = 0;
+  commentHasMore = false;
+  // 记住从哪来的：聊天页、视频页、还是搜索结果页，返回时回到原来那页
+  if (!document.getElementById('chatView').classList.contains('hidden')) commentReturnTo = 'chatView';
+  else if (!document.getElementById('channelView').classList.contains('hidden')) commentReturnTo = 'channelView';
+  else commentReturnTo = 'chatView';
+  document.getElementById('commentsTitle').textContent = '评论';
+  const el = document.querySelector(`.chat-msg[data-msg-id="${msgId}"]`);
+  const txt = el ? el.textContent.trim().replace(/\s+/g,' ').slice(0,80) : '';
+  document.getElementById('commentOrig').textContent = txt ? ('原帖：' + txt) : '';
+  document.getElementById('commentMessages').innerHTML = '正在加载评论…';
+  document.getElementById('commentLoadMoreWrap').classList.add('hidden');
+  showView('commentsView');
+  window.scrollTo({top:0,behavior:'smooth'});
+  await loadCommentPage(false);
+}
+function backFromComments(){
+  closePlayer();
+  if (commentReturnTo === 'channelView' && currentChannelId) { showView('channelView'); }
+  else if (currentChannelId) { loadChat(currentChannelId, currentChannelTitle, currentChannelUsername); }
+  else { showView('channelsView'); loadChannels(); }
+}
+async function loadCommentPage(appendOlder){
+  const box = document.getElementById('commentMessages');
+  const btn = document.getElementById('commentLoadMoreBtn');
+  if (appendOlder) { btn.disabled = true; btn.textContent = '正在加载…'; }
+  try{
+    const d = await api(`/api/comments?channel_id=${commentChannelId}&msg_id=${commentMsgId}&limit=30&offset_id=${commentOldestId}` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
+    commentDiscChannelId = d.discussion_channel_id || commentChannelId;
+    const chronological = [...d.messages].reverse();
+    if (!appendOlder) {
+      box.innerHTML = d.messages.length ? chatListHtml(chronological, null, commentDiscChannelId, '') : '<div class="muted">这个帖子还没有评论。</div>';
+      window.scrollTo({top:document.body.scrollHeight, behavior:'auto'});
+    } else if (d.messages.length) {
+      const oldHeight = document.body.scrollHeight;
+      const oldScrollY = window.scrollY;
+      box.insertAdjacentHTML('afterbegin', chatListHtml(chronological, null, commentDiscChannelId, ''));
+      dedupeDateSeps(box);
+      window.scrollTo({top: oldScrollY + (document.body.scrollHeight - oldHeight), behavior:'auto'});
+    }
+    commentHasMore = !!d.has_more;
+    commentOldestId = d.next_offset_id || commentOldestId;
+    const wrap = document.getElementById('commentLoadMoreWrap');
+    if (commentHasMore) { wrap.classList.remove('hidden'); btn.disabled = false; btn.textContent = '加载更早的评论'; }
+    else { wrap.classList.add('hidden'); }
+  }catch(e){ box.innerHTML = '<div class="muted">' + esc(e.message) + '</div>'; }
+}
+async function loadOlderComments(){ await loadCommentPage(true); }
+async function sendComment(){
+  const input = document.getElementById('commentInput');
+  const text = input.value.trim();
+  if (!text) return;
+  try{
+    const d = await api('/api/comment',{method:'POST', body:JSON.stringify({channel_id: commentChannelId, msg_id: commentMsgId, text, username: currentChannelUsername || null})});
+    const box = document.getElementById('commentMessages');
+    if (box.textContent.includes('还没有评论')) box.innerHTML = '';
+    commentDiscChannelId = d.discussion_channel_id || commentDiscChannelId || commentChannelId;
+    const lastMsgEl = box.querySelector('.chat-msg:last-child');
+    const lastDate = lastMsgEl ? lastMsgEl.dataset.date : null;
+    box.insertAdjacentHTML('beforeend', chatListHtml([d.message], lastDate, commentDiscChannelId, ''));
+    input.value = '';
+    input.scrollIntoView({behavior:'smooth', block:'end'});
+  }catch(e){ alert(e.message); }
+}
+document.getElementById('commentInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendComment(); });
 
 let kbCache = {};
 async function clickInlineBtn(channelId, msgId, row, col){
