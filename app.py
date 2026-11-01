@@ -301,6 +301,32 @@ _entity_cache: dict = {}
 _entity_cache_by_username: dict = {}
 _recently_joined: list = []
 
+# 对话列表缓存：iter_dialogs(limit=1000) 原来在搜索、加入、我的频道、实体解析 5 处各拉一遍，
+# 加入一次可能拉 2～3 遍，又慢又容易 FloodWait。缓存 5 分钟，5 分钟内所有地方共用同一份；
+# 网页上加入/邀请加入成功时立刻失效，下一次拉取就是最新的。经 Telegram App 加入的，
+# 最多晚 5 分钟才出现在列表里，这是缓存的代价。
+_dialogs_cache: dict = {"time": 0.0, "dialogs": []}
+_dialogs_lock = asyncio.Lock()
+_DIALOGS_TTL = 300
+
+
+async def _get_dialogs(client):
+    async with _dialogs_lock:
+        if _dialogs_cache["dialogs"] and time.time() - _dialogs_cache["time"] < _DIALOGS_TTL:
+            return _dialogs_cache["dialogs"]
+        dialogs = []
+        async for dialog in client.iter_dialogs(limit=1000):
+            dialogs.append(dialog)
+            _cache_entity(dialog.entity)
+        _dialogs_cache["dialogs"] = dialogs
+        _dialogs_cache["time"] = time.time()
+        return dialogs
+
+
+def _invalidate_dialogs():
+    _dialogs_cache["dialogs"] = []
+    _dialogs_cache["time"] = 0.0
+
 
 def _mark_recently_joined(entity):
     if entity is None:
@@ -364,7 +390,7 @@ async def search(request: Request, q: str):
         pass
     # 3) 已加入的对话里按名字过滤（中文名、已加的私密频道主要靠这个）
     try:
-        async for dialog in client.iter_dialogs(limit=1000):
+        for dialog in await _get_dialogs(client):
             title = dialog.title or ""
             if q.lower() in title.lower() or (search_q and search_q.lower() in title.lower()):
                 add(dialog.entity)
@@ -411,6 +437,7 @@ async def join(request: Request, body: JoinIn):
             raise HTTPException(status_code=code, detail=detail)
         entity = res.chats[0] if res.chats else None
         _mark_recently_joined(entity)
+        _invalidate_dialogs()
         return {"ok": True, "joined": _chat_info(entity) if entity else None}
     # 数字 id：先在已加入对话里找，找不到再当 PeerChannel 解析（失败给 400 明示，不抛 500）
     entity = None
@@ -424,7 +451,7 @@ async def join(request: Request, body: JoinIn):
             if cid in _entity_cache:
                 entity = _entity_cache[cid]
                 break
-            async for dialog in client.iter_dialogs(limit=1000):
+            for dialog in await _get_dialogs(client):
                 if dialog.entity.id == cid:
                     entity = dialog.entity
                     _cache_entity(entity)
@@ -453,7 +480,7 @@ async def join(request: Request, body: JoinIn):
                 raise HTTPException(status_code=400, detail="找不到这个频道，请确认用户名/链接正确")
     # 已经在对话里就是已经加入/已经在群组里了，直接当成功（之前这里对 Chat 类型直接报错，
     # 导致已在群组里的结果点加入也失败，用户就看到“频道不能加入”）
-    async for dialog in client.iter_dialogs(limit=1000):
+    for dialog in await _get_dialogs(client):
         if dialog.entity.id == entity.id:
             _mark_recently_joined(entity)
             return {"ok": True, "joined": _chat_info(entity)}
@@ -462,6 +489,7 @@ async def join(request: Request, body: JoinIn):
     try:
         await client(JoinChannelRequest(entity))
         _mark_recently_joined(entity)
+        _invalidate_dialogs()
     except Exception as e:
         msg = str(e)
         if "ALREADY" in msg.upper() or "PARTICIPANT" in msg.upper():
@@ -479,7 +507,7 @@ async def my_channels(request: Request):
     client = await require_login()
     out = []
     seen = set()
-    async for dialog in client.iter_dialogs(limit=1000):
+    for dialog in await _get_dialogs(client):
         e = dialog.entity
         _cache_entity(e)
         if isinstance(e, (Channel, Chat)) and e.id not in seen:
@@ -529,8 +557,7 @@ async def _channel_entity(client, channel_id: int, username=None):
             return _entity_cache[channel_id]
         if uname and uname[1:].lower() in _entity_cache_by_username:
             return _entity_cache_by_username[uname[1:].lower()]
-        async for dialog in client.iter_dialogs(limit=1000):
-            _cache_entity(dialog.entity)
+        for dialog in await _get_dialogs(client):
             if dialog.entity.id == channel_id:
                 return dialog.entity
     if uname:
@@ -544,6 +571,79 @@ async def _channel_entity(client, channel_id: int, username=None):
         return await client.get_entity(PeerChannel(channel_id))
     except Exception:
         raise HTTPException(status_code=404, detail="找不到这个频道，请重新搜索一次再点进入")
+
+
+# 消息对象缓存：缩略图一张、视频拖进度一次 Range，原来每次都 get_messages 重新取消息，
+# 一页 30 张就是 30 次。列表加载时把消息对象存下来，缩略图/播放直接用，不再重复取。
+# 只存消息元数据（媒体引用），不存视频字节，所以占内存很小；30 分钟过期，过期后回落到 get_messages。
+_msg_cache: dict = {}
+_MSG_TTL = 1800
+_MSG_MAX = 2000
+
+
+def _cache_msg(channel_id, msg):
+    if msg is None:
+        return
+    key = (channel_id, msg.id)
+    if len(_msg_cache) >= _MSG_MAX:
+        oldest = sorted(_msg_cache.items(), key=lambda kv: kv[1][1])[:500]
+        for k, _ in oldest:
+            _msg_cache.pop(k, None)
+    _msg_cache[key] = (msg, time.time())
+
+
+def _cached_msg(channel_id, msg_id):
+    item = _msg_cache.get((channel_id, msg_id))
+    if item is None:
+        return None
+    msg, ts = item
+    if time.time() - ts > _MSG_TTL:
+        _msg_cache.pop((channel_id, msg_id), None)
+        return None
+    return msg
+
+
+async def _get_message(client, channel_id, msg_id, username=None):
+    msg = _cached_msg(channel_id, msg_id)
+    if msg is not None:
+        return msg
+    entity = await _channel_entity(client, channel_id, username)
+    msg = await client.get_messages(entity, ids=msg_id)
+    if msg is not None:
+        _cache_msg(channel_id, msg)
+    return msg
+
+
+# 按字节限的 LRU 图片缓存：原来原图按 100 张、缩略图按 300 张算，满了就一次全清，
+# 原图 1～2MB 一张最坏吃一两百 MB，清完又全部重新下。改成按总字节淘汰最久没用的，
+# 缩略图 20MB、原图 50MB；单张超上限的不缓存，避免一张大图把整个缓存挤空。
+class _BytesLRU:
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+        self._data = {}
+        self._order = []
+        self._total = 0
+
+    def get(self, key):
+        if key not in self._data:
+            return None
+        self._order.remove(key)
+        self._order.append(key)
+        return self._data[key]
+
+    def put(self, key, data):
+        size = len(data)
+        if size > self.max_bytes:
+            return
+        if key in self._data:
+            self._total -= len(self._data[key])
+            self._order.remove(key)
+        self._data[key] = data
+        self._order.append(key)
+        self._total += size
+        while self._total > self.max_bytes and self._order:
+            old = self._order.pop(0)
+            self._total -= len(self._data.pop(old))
 
 
 def _video_info(msg):
@@ -581,8 +681,10 @@ async def videos(request: Request, channel_id: int, limit: int = 30, offset_id: 
     # offset_id 是上一页最后一个视频的 msg_id，Telethon 只返回比它更旧的消息（不含它本身）
     # 多取 1 条用来判断还有没有下一页
     out = []
-    async for msg in client.iter_messages(entity, limit=(limit + 1) * 3, offset_id=offset_id,
+    # 原来是 (limit+1)*3：已经用了只取视频的过滤器，服务端返回的就全是视频，没必要多取 3 倍。
+    async for msg in client.iter_messages(entity, limit=limit + 1, offset_id=offset_id,
                                           filter=InputMessagesFilterVideo):
+        _cache_msg(channel_id, msg)
         info = _video_info(msg)
         if info:
             out.append(info)
@@ -597,7 +699,7 @@ async def videos(request: Request, channel_id: int, limit: int = 30, offset_id: 
 
 
 # ---------- 视频缩略图：取视频自带的最大缩略图，不下载正片 ----------
-_thumb_cache: dict = {}
+_thumb_cache = _BytesLRU(20 * 1024 * 1024)
 
 def _sniff_image_type(data: bytes) -> str:
     if data.startswith(b"\xff\xd8"):
@@ -616,17 +718,14 @@ async def thumb(request: Request, channel_id: int, msg_id: int, username: str | 
     key = (channel_id, msg_id)
     data = _thumb_cache.get(key)
     if data is None:
-        entity = await _channel_entity(client, channel_id, username)
-        msg = await client.get_messages(entity, ids=msg_id)
+        msg = await _get_message(client, channel_id, msg_id, username)
         if msg is None:
             raise HTTPException(status_code=404, detail="找不到这条视频")
         # thumb=-1 取最大的那张缩略图；没有缩略图返回 None
         data = await client.download_media(msg, file=bytes, thumb=-1)
         if data is None:
             raise HTTPException(status_code=404, detail="这条视频没有缩略图")
-        if len(_thumb_cache) > 300:
-            _thumb_cache.clear()
-        _thumb_cache[key] = data
+        _thumb_cache.put(key, data)
     return Response(content=data, media_type=_sniff_image_type(data),
                     headers={"Cache-Control": "private, max-age=86400"})
 
@@ -729,7 +828,8 @@ async def messages(request: Request, channel_id: int, limit: int = 30, offset_id
     limit = max(1, min(limit, 100))
     entity = await _channel_entity(client, channel_id, username)
     out = []
-    async for msg in client.iter_messages(entity, limit=(limit + 1) * 2, offset_id=offset_id):
+    async for msg in client.iter_messages(entity, limit=limit + 1, offset_id=offset_id):
+        _cache_msg(channel_id, msg)
         info = _message_info(msg)
         if info:
             out.append(info)
@@ -753,7 +853,8 @@ async def search_messages(request: Request, channel_id: int, q: str, limit: int 
         return {"messages": [], "has_more": False, "next_offset_id": None}
     entity = await _channel_entity(client, channel_id, username)
     out = []
-    async for msg in client.iter_messages(entity, search=q, limit=(limit + 1) * 2, offset_id=offset_id):
+    async for msg in client.iter_messages(entity, search=q, limit=limit + 1, offset_id=offset_id):
+        _cache_msg(channel_id, msg)
         info = _message_info(msg)
         if info:
             out.append(info)
@@ -822,7 +923,7 @@ async def send_message(request: Request, body: SendIn):
     return {"ok": True, "message": _message_info(sent)}
 
 
-_photo_cache: dict = {}
+_photo_cache = _BytesLRU(50 * 1024 * 1024)
 
 
 @app.get("/photo/{channel_id}/{msg_id}")
@@ -832,16 +933,13 @@ async def photo(request: Request, channel_id: int, msg_id: int, username: str | 
     key = (channel_id, msg_id)
     data = _photo_cache.get(key)
     if data is None:
-        entity = await _channel_entity(client, channel_id, username)
-        msg = await client.get_messages(entity, ids=msg_id)
+        msg = await _get_message(client, channel_id, msg_id, username)
         if msg is None or not msg.photo:
             raise HTTPException(status_code=404, detail="这条消息没有图片")
         data = await client.download_media(msg, file=bytes)
         if data is None:
             raise HTTPException(status_code=404, detail="图片下载失败")
-        if len(_photo_cache) > 100:
-            _photo_cache.clear()
-        _photo_cache[key] = data
+        _photo_cache.put(key, data)
     return Response(content=data, media_type=_sniff_image_type(data),
                     headers={"Cache-Control": "private, max-age=86400"})
 
@@ -874,8 +972,7 @@ def _parse_range(range_header: str | None, total: int):
 async def stream(request: Request, channel_id: int, msg_id: int, username: str | None = None):
     check_web_auth(request)
     client = await require_login()
-    entity = await _channel_entity(client, channel_id, username)
-    msg = await client.get_messages(entity, ids=msg_id)
+    msg = await _get_message(client, channel_id, msg_id, username)
     if msg is None:
         raise HTTPException(status_code=404, detail="找不到这条视频")
     media = msg.media

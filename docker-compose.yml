@@ -6,6 +6,11 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       TG_API_ID: "${TG_API_ID}"
       TG_API_HASH: "${TG_API_HASH}"
