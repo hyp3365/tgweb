@@ -193,6 +193,9 @@ a.kb-btn{display:block}
     <button id="chatSearchNextBtn" onclick="loadMoreSearchMessages()">下一页</button>
     <span id="chatSearchNextStatus" class="muted"></span>
   </div>
+  <div id="chatNewMsgBar" class="hidden" style="text-align:center;margin:10px 0">
+    <button onclick="showNewChatMessages()">有新消息，点击查看</button>
+  </div>
   <div class="chat-input-row">
     <input id="chatInput" placeholder="输入消息…">
     <button onclick="sendChatMessage()">发送</button>
@@ -346,7 +349,7 @@ async function sendCode(){
   if (!phone) { err.textContent = '请先填手机号'; return; }
   try{
     await api('/api/login',{method:'POST',body:JSON.stringify({phone})});
-    document.getElementById('codeSentTo').textContent = '验证码已发到 ' + phone;
+    document.getElementById('codeSentTo').textContent = '验证码已发送到app';
     document.getElementById('code').value = '';
     showLoginStep(2);
     document.getElementById('code').focus();
@@ -542,6 +545,18 @@ let currentChatChannelId = null;
 let chatOldestId = 0;
 let chatHasMore = false;
 let chatLoading = false;
+let chatDisplayedIds = new Set();
+let chatNewestId = 0;
+let chatUnreadCount = 0;
+function hideChatNewMsgBar(){
+  const b = document.getElementById('chatNewMsgBar');
+  if (b) b.classList.add('hidden');
+  chatUnreadCount = 0;
+}
+function showNewChatMessages(){
+  hideChatNewMsgBar();
+  window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
+}
 function chatBubble(m, channelId){
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
@@ -578,6 +593,7 @@ async function loadChat(channelId, title, username=''){
   document.getElementById('clearChatSearchBtn').classList.add('hidden');
   document.getElementById('chatSearchNextWrap').classList.add('hidden');
   chatOldestId = 0; chatHasMore = false;
+  chatDisplayedIds = new Set(); chatNewestId = 0; hideChatNewMsgBar();
   showView('chatView');
   window.scrollTo({top:0,behavior:'smooth'});
   await loadChatPage(false);
@@ -594,8 +610,12 @@ async function loadChatPage(appendOlder){
     if (!appendOlder) {
       box.innerHTML = d.messages.length ? chronological.map(m=>chatBubble(m, currentChatChannelId)).join('')
         : '<div class="muted">这个频道还没有消息。</div>';
+      chatDisplayedIds = new Set(chronological.map(m=>m.msg_id));
+      chatNewestId = chronological.length ? Math.max(...chronological.map(m=>m.msg_id)) : 0;
+      hideChatNewMsgBar();
       window.scrollTo({top:document.body.scrollHeight, behavior:'auto'});
     } else if (d.messages.length) {
+      chronological.forEach(m=>chatDisplayedIds.add(m.msg_id));
       box.insertAdjacentHTML('afterbegin', chronological.map(m=>chatBubble(m, currentChatChannelId)).join(''));
       window.scrollTo({top:0, behavior:'smooth'});
     }
@@ -612,6 +632,45 @@ async function loadChatPage(appendOlder){
   chatLoading = false;
 }
 async function loadOlderChat(){ await loadChatPage(true); }
+// 聊天自动刷新：每 5 秒查一次最新消息，不用退出重进就能看到频道/机器人的回复。
+// 只在聊天页可见、没在搜消息、没在看视频播放器、页面没切到后台时才查；
+// 查失败不弹窗，下一次再查。已经在屏幕上的消息按 id 去重，不会重复出现。
+// 如果你正在看底部的最新消息，新消息来了就自动滑到底部；
+// 如果你在往上翻旧消息，新消息会先贴在下面，不强制把你拉到底部，
+// 而是显示“有新消息，点击查看”，点了才滑到底部。
+async function pollNewChatMessages(){
+  if (!currentChatChannelId) return;
+  const cv = document.getElementById('chatView');
+  if (!cv || cv.classList.contains('hidden')) return;
+  if (chatSearching) return;
+  if (document.hidden) return;
+  const pm = document.getElementById('playerModal');
+  if (pm && !pm.classList.contains('hidden')) return;
+  try{
+    const d = await api(`/api/messages?channel_id=${currentChatChannelId}&limit=30&offset_id=0` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
+    const chronological = [...d.messages].reverse();
+    const fresh = chronological.filter(m=>!chatDisplayedIds.has(m.msg_id));
+    if (!fresh.length) return;
+    fresh.forEach(m=>{ chatDisplayedIds.add(m.msg_id); if (m.msg_id > chatNewestId) chatNewestId = m.msg_id; });
+    const box = document.getElementById('chatMessages');
+    if (box.textContent.includes('还没有消息')) box.innerHTML = '';
+    box.insertAdjacentHTML('beforeend', fresh.map(m=>chatBubble(m, currentChatChannelId)).join(''));
+    const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 300);
+    if (nearBottom) {
+      hideChatNewMsgBar();
+      window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
+    } else {
+      chatUnreadCount += fresh.length;
+      const bar = document.getElementById('chatNewMsgBar');
+      if (bar) {
+        bar.classList.remove('hidden');
+        const btn = bar.querySelector('button');
+        if (btn) btn.textContent = '有 ' + chatUnreadCount + ' 条新消息，点击查看';
+      }
+    }
+  }catch(e){ /* 静默，下一次再查 */ }
+}
+setInterval(pollNewChatMessages, 5000);
 let chatSearchQ = '';
 let chatSearchOffset = 0;
 let chatSearchHasMore = false;
@@ -676,6 +735,10 @@ async function sendChatMessage(){
     const d = await api('/api/send',{method:'POST', body:JSON.stringify({channel_id: currentChatChannelId, text, username: currentChannelUsername || null})});
     const box = document.getElementById('chatMessages');
     if (box.textContent.includes('还没有消息')) box.innerHTML = '';
+    if (d.message && d.message.msg_id) {
+      chatDisplayedIds.add(d.message.msg_id);
+      if (d.message.msg_id > chatNewestId) chatNewestId = d.message.msg_id;
+    }
     box.insertAdjacentHTML('beforeend', chatBubble(d.message, currentChatChannelId));
     input.value = '';
     input.scrollIntoView({behavior:'smooth', block:'end'});
