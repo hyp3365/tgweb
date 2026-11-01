@@ -109,10 +109,14 @@ a.kb-btn{display:block}
    底部 64px 的空还是给关闭按钮留的，进度条不会被按钮压住。
    上次直接沉到底嫌太低了，这次往上移半个播放器框高：框本身 translateY(-50%)，
    也就是框高的一半，进度条从贴底边升到屏幕下半段中间，拇指还能够到，又不至于太低。
-   只在竖屏上这样，横屏高度本来就不够，再往上移会把视频顶出屏幕，横屏还是居中。 */
+   只在竖屏上这样，横屏高度本来就不够，再往上移会把视频顶出屏幕，横屏还是居中。
+   再往上移 1 厘米（手机屏幕上的物理厘米，不是 CSS 的 1cm）：
+   常见手机 1 个 CSS 像素约等于 0.16 毫米，所以 1 厘米约等于 62 个 CSS 像素，
+   CSS 的 1cm 只等于 37.8 像素，在手机上实际只有约 0.6 厘米，会移少了，
+   所以这里直接加 62px。不同手机屏幕密度略有差别，实际大概在 0.9～1.1 厘米之间。 */
 @media (pointer: coarse) and (orientation: portrait), (max-width: 768px) and (orientation: portrait) {
   .modal{align-items:flex-end}
-  .modal-box{transform:translateY(-50%)}
+  .modal-box{transform:translateY(calc(-50% - 62px))}
 }
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
