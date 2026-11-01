@@ -45,8 +45,18 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 .channel-actions{display:flex;gap:6px;flex-shrink:0}
 .channel-actions button{padding:6px 12px;font-size:13px;margin:0}
 .chat-wrap{max-width:760px;margin:0 auto}
-.chat-msg{background:#111;border:1px solid #222;border-radius:12px;padding:10px 12px;margin:10px 0}
-.chat-msg.highlight{border-color:#888;background:#1e1e1e}
+.chat-msg{background:transparent;border:none;border-radius:12px;padding:0;margin:10px 0;display:flex;gap:8px;align-items:flex-end}
+.chat-msg.highlight .chat-bubble{border-color:#888;background:#1e1e1e}
+.chat-msg.own{justify-content:flex-end}
+.chat-msg.own .chat-bubble{background:#1f4d2e;border-color:#2a5d3a}
+.chat-bubble{background:#111;border:1px solid #222;border-radius:12px;padding:10px 12px;max-width:78%;min-width:0;overflow-wrap:anywhere}
+.chat-avatar{width:36px;height:36px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px;overflow:hidden;position:relative}
+.chat-avatar img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.chat-sender{font-size:13px;font-weight:700;margin-bottom:4px}
+.chat-time{font-size:11px;color:#888;text-align:right;margin-top:4px}
+.chat-msg.own .chat-time{color:#a8c3b0}
+.chat-date-sep{text-align:center;margin:18px 0 8px}
+.chat-date-sep span{background:#1a1a1a;color:#888;font-size:12px;padding:4px 12px;border-radius:12px}
 .chat-msg .chat-meta{color:#888;font-size:12px;margin-bottom:4px}
 .chat-msg img{max-width:100%;height:auto;border-radius:8px;display:block;margin-top:6px;background:#111}
 .chat-thumb{position:relative;max-width:320px;aspect-ratio:16/9;background:#111;border-radius:8px;overflow:hidden;cursor:pointer;margin-top:6px}
@@ -592,6 +602,58 @@ function showNewChatMessages(){
   hideChatNewMsgBar();
   window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
 }
+const SENDER_COLORS = ['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#4dabf7','#9775fa','#f783ac','#e599f7'];
+function senderColor(senderId){
+  if (senderId == null) return '#888';
+  const n = Math.abs(Number(senderId) || 0);
+  return SENDER_COLORS[n % SENDER_COLORS.length];
+}
+function chatTimeStr(dateStr){
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+function chatDateKey(dateStr){
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function chatDateLabel(key){
+  if (!key) return '';
+  const now = new Date();
+  const today = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-' + String(now.getDate()).padStart(2,'0');
+  const y = new Date(now.getTime() - 24*3600*1000);
+  const yesterday = y.getFullYear() + '-' + String(y.getMonth()+1).padStart(2,'0') + '-' + String(y.getDate()).padStart(2,'0');
+  if (key === today) return '今天';
+  if (key === yesterday) return '昨天';
+  const parts = key.split('-');
+  return parts[0] + '年' + Number(parts[1]) + '月' + Number(parts[2]) + '日';
+}
+function chatDateSepHtml(key){
+  return `<div class="chat-date-sep" data-date="${key}"><span>${chatDateLabel(key)}</span></div>`;
+}
+// 按时间顺序的消息列表，中间按天插日期分隔；skipFirstDate 是上一批最后一天，
+// 那天已经有分隔了就不再重复插一个（轮询和发消息时用，初始加载传空）
+function chatListHtml(messages, skipFirstDate){
+  let html = '';
+  let lastDate = skipFirstDate || null;
+  messages.forEach(m=>{
+    const k = chatDateKey(m.date);
+    if (k && k !== lastDate) { html += chatDateSepHtml(k); lastDate = k; }
+    html += chatBubble(m, currentChatChannelId);
+  });
+  return html;
+}
+function dedupeDateSeps(box){
+  // 往更早翻时，新旧两批同一天的分隔会重复出现（中间隔着那天的消息），
+  // 按顺序只留第一个，删掉后面重复的
+  let seen = null;
+  box.querySelectorAll('.chat-date-sep').forEach(sep=>{
+    const d = sep.dataset.date;
+    if (d === seen) sep.remove();
+    else seen = d;
+  });
+}
 function chatBubble(m, channelId){
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
@@ -611,7 +673,16 @@ function chatBubble(m, channelId){
       return `<button class="kb-btn" onclick="clickInlineBtn(${channelId},${m.msg_id},${ri},${ci})">${esc(b.text)}</button>`;
     }).join('') + `</div>`).join('') + `</div>`;
   }
-  return `<div class="chat-msg" data-msg-id="${m.msg_id}"><div class="chat-meta">${m.date?new Date(m.date).toLocaleString():''}</div>${body}</div>`;
+  const isOwn = !!m.out;
+  const showSender = !isOwn && m.sender_is_user && m.sender_name;
+  const color = senderColor(m.sender_id);
+  const initial = showSender ? esc(String(m.sender_name).trim().charAt(0).toUpperCase() || '?') : '?';
+  const avatar = showSender
+    ? `<div class="chat-avatar" style="background:${color}"><span>${initial}</span><img src="${WEB_BASE}/avatar/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.style.display='none'"></div>`
+    : '';
+  const nameHtml = showSender ? `<div class="chat-sender" style="color:${color}">${esc(m.sender_name)}</div>` : '';
+  const timeHtml = `<div class="chat-time">${chatTimeStr(m.date)}</div>`;
+  return `<div class="chat-msg${isOwn ? ' own' : ''}" data-msg-id="${m.msg_id}" data-date="${chatDateKey(m.date)}">${avatar}<div class="chat-bubble">${nameHtml}${body}${timeHtml}</div></div>`;
 }
 async function loadChat(channelId, title, username=''){
   currentChatChannelId = channelId;
@@ -643,7 +714,7 @@ async function loadChatPage(appendOlder){
     const box = document.getElementById('chatMessages');
     const chronological = [...d.messages].reverse();
     if (!appendOlder) {
-      box.innerHTML = d.messages.length ? chronological.map(m=>chatBubble(m, currentChatChannelId)).join('')
+      box.innerHTML = d.messages.length ? chatListHtml(chronological, null)
         : '<div class="muted">这个频道还没有消息。</div>';
       chatDisplayedIds = new Set(chronological.map(m=>m.msg_id));
       chatMsgHash = {};
@@ -660,7 +731,8 @@ async function loadChatPage(appendOlder){
       const oldHeight = document.body.scrollHeight;
       const oldScrollY = window.scrollY;
       chronological.forEach(m=>chatDisplayedIds.add(m.msg_id));
-      box.insertAdjacentHTML('afterbegin', chronological.map(m=>chatBubble(m, currentChatChannelId)).join(''));
+      box.insertAdjacentHTML('afterbegin', chatListHtml(chronological, null));
+      dedupeDateSeps(box);
       const delta = document.body.scrollHeight - oldHeight;
       window.scrollTo({top: oldScrollY + delta, behavior:'auto'});
     }
@@ -710,7 +782,9 @@ async function pollNewChatMessages(){
     fresh.forEach(m=>{ chatDisplayedIds.add(m.msg_id); chatMsgHash[m.msg_id] = msgHash(m); if (m.msg_id > chatNewestId) chatNewestId = m.msg_id; });
     const box = document.getElementById('chatMessages');
     if (box.textContent.includes('还没有消息')) box.innerHTML = '';
-    box.insertAdjacentHTML('beforeend', fresh.map(m=>chatBubble(m, currentChatChannelId)).join(''));
+    const lastMsgEl = box.querySelector('.chat-msg:last-child');
+    const lastDate = lastMsgEl ? lastMsgEl.dataset.date : null;
+    box.insertAdjacentHTML('beforeend', chatListHtml(fresh, lastDate));
     const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 300);
     if (nearBottom) {
       hideChatNewMsgBar();
@@ -796,7 +870,9 @@ async function sendChatMessage(){
       chatMsgHash[d.message.msg_id] = msgHash(d.message);
       if (d.message.msg_id > chatNewestId) chatNewestId = d.message.msg_id;
     }
-    box.insertAdjacentHTML('beforeend', chatBubble(d.message, currentChatChannelId));
+    const lastMsgEl = box.querySelector('.chat-msg:last-child');
+    const lastDate = lastMsgEl ? lastMsgEl.dataset.date : null;
+    box.insertAdjacentHTML('beforeend', chatListHtml([d.message], lastDate));
     input.value = '';
     input.scrollIntoView({behavior:'smooth', block:'end'});
   }catch(e){ alert(e.message); }

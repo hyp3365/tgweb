@@ -875,6 +875,32 @@ def _message_info(msg):
                 pw, ph = best.w, best.h
         except Exception:
             pw = ph = None
+    # 发送人：App 样式的气泡、头像、名字用。sender 可能是 User 或 Channel，
+    # 没有就是 None（比如已删号），频道帖子还可能只有 post_author 签名。
+    sender = getattr(msg, "sender", None)
+    sender_name = None
+    sender_username = None
+    sender_is_user = False
+    if sender is not None:
+        try:
+            first = getattr(sender, "first_name", "") or ""
+            last = getattr(sender, "last_name", "") or ""
+            sender_name = (first + (" " + last if last else "")).strip()
+            if not sender_name:
+                sender_name = getattr(sender, "title", "") or getattr(sender, "username", "") or None
+            sender_username = getattr(sender, "username", None)
+            # User 才有 first_name/last_name，Channel 只有 title，靠这个区分
+            sender_is_user = bool(first or last or getattr(sender, "username", None)) and getattr(sender, "title", None) is None
+            # 更稳妥：User 类型没有 title 属性以外的频道特征，上面已够用；
+            # 如果 sender 是频道，名字就是频道名，前端按频道帖子处理（不显示头像名字）
+            if getattr(sender, "title", None):
+                sender_is_user = False
+        except Exception:
+            sender_name = None
+            sender_username = None
+            sender_is_user = False
+    elif getattr(msg, "post_author", None):
+        sender_name = msg.post_author
     return {"msg_id": msg.id,
             "kind": kind,
             "text": (msg.text or "")[:2000],
@@ -886,6 +912,11 @@ def _message_info(msg):
             "has_thumb": bool(doc is not None and getattr(doc, "thumbs", None)),
             "pw": pw,
             "ph": ph,
+            "sender_id": getattr(msg, "sender_id", None),
+            "sender_name": sender_name,
+            "sender_username": sender_username,
+            "sender_is_user": sender_is_user,
+            "out": bool(getattr(msg, "out", False)),
             "buttons": _inline_buttons(msg)}
 
 
@@ -992,6 +1023,34 @@ async def send_message(request: Request, body: SendIn):
 
 
 _photo_cache = _BytesLRU(50 * 1024 * 1024)
+_avatar_cache = _BytesLRU(20 * 1024 * 1024)
+
+
+@app.get("/avatar/{channel_id}/{msg_id}")
+async def avatar(request: Request, channel_id: int, msg_id: int, username: str | None = None):
+    # 按消息找发送人头像：先从消息缓存里拿原消息，再按发送人 id 查头像缓存，
+    # 没缓存才走一次 Telegram 下载，之后都走缓存，内存有 20MB 上限，不会无限涨。
+    # 没有头像（或发送人未知）就 404，前端会显示首字母占位，不会破图。
+    check_web_auth(request)
+    client = await require_login()
+    msg = await _get_message(client, channel_id, msg_id, username)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="找不到这条消息")
+    sender = getattr(msg, "sender", None)
+    sender_id = getattr(msg, "sender_id", None)
+    if sender is None or sender_id is None:
+        raise HTTPException(status_code=404, detail="这条消息没有发送人头像")
+    data = _avatar_cache.get(sender_id)
+    if data is None:
+        try:
+            data = await client.download_profile_photo(sender, file=bytes)
+        except Exception:
+            data = None
+        if not data:
+            raise HTTPException(status_code=404, detail="发送人没有头像")
+        _avatar_cache.put(sender_id, data)
+    return Response(content=data, media_type=_sniff_image_type(data),
+                    headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/photo/{channel_id}/{msg_id}")
