@@ -104,7 +104,14 @@ def _client_ip(request):
             pass
     return host or "unknown"
 _client: TelegramClient | None = None
+# 手机号和验证码哈希只在内存里留着，第一步到第二步之间要用，验证完就删，
+# 从来不写磁盘、不写日志、不进 session 文件。二次验证密码连这里都不进，
+# 只在验证那一下传给 sign_in，用完就清。
 _login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}
+
+
+def _clear_login_state():
+    _login_state.clear()
 
 
 def check_web_auth(request: Request):
@@ -251,12 +258,15 @@ async def status(request: Request):
 async def login_phone(request: Request, body: PhoneIn):
     check_web_auth(request)
     client = await get_client()
+    phone = body.phone.strip()
+    body.phone = ""
     try:
-        sent = await client.send_code_request(body.phone.strip())
+        sent = await client.send_code_request(phone)
     except Exception as e:
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
-    _login_state["phone"] = body.phone.strip()
+    _login_state.clear()
+    _login_state["phone"] = phone
     _login_state["phone_code_hash"] = sent.phone_code_hash
     return {"ok": True, "need_code": True}
 
@@ -268,14 +278,22 @@ async def login_code(request: Request, body: CodeIn):
     phone = _login_state.get("phone")
     if not phone:
         raise HTTPException(status_code=400, detail="请先填手机号获取验证码")
+    code = body.code.strip()
+    body.code = ""
     try:
-        await client.sign_in(phone, body.code.strip(),
+        await client.sign_in(phone, code,
                              phone_code_hash=_login_state.get("phone_code_hash"))
     except SessionPasswordNeededError:
+        # 验证码已通过，手机号和哈希不再需要，二次验证那步不用它们，直接删
+        _clear_login_state()
         return {"ok": False, "need_password": True}
     except Exception as e:
+        # 验证码不对时不删，留着让用户直接重填验证码重试，不用重新发；
+        # 成功、需要二次验证、退出、重启、下一次填新手机号时都会清掉
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
+    # 验证码已通过，手机号和哈希用完就删
+    _clear_login_state()
     return {"ok": True, "logged_in": True}
 
 
@@ -283,11 +301,16 @@ async def login_code(request: Request, body: CodeIn):
 async def login_password(request: Request, body: PasswordIn):
     check_web_auth(request)
     client = await get_client()
+    pw = body.password
+    body.password = ""
     try:
-        await client.sign_in(password=body.password)
+        await client.sign_in(password=pw)
     except Exception as e:
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
+    finally:
+        pw = ""
+    _clear_login_state()
     return {"ok": True, "logged_in": True}
 
 
@@ -305,8 +328,10 @@ async def web_logout(request: Request):
 @app.post("/api/logout")
 async def logout(request: Request):
     check_web_auth(request)
+    _clear_login_state()
     client = await get_client()
     await client.log_out()
+    _clear_login_state()
     return {"ok": True}
 
 
