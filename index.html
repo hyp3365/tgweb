@@ -47,7 +47,7 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 .chat-wrap{max-width:760px;margin:0 auto}
 .chat-msg{background:#111;border:1px solid #222;border-radius:12px;padding:10px 12px;margin:10px 0}
 .chat-msg .chat-meta{color:#888;font-size:12px;margin-bottom:4px}
-.chat-msg img{max-width:100%;border-radius:8px;display:block;margin-top:6px}
+.chat-msg img{max-width:100%;height:auto;border-radius:8px;display:block;margin-top:6px;background:#111}
 .chat-thumb{position:relative;max-width:320px;aspect-ratio:16/9;background:#111;border-radius:8px;overflow:hidden;cursor:pointer;margin-top:6px}
 .chat-thumb img{width:100%;height:100%;object-fit:cover;margin:0}
 .chat-input-row{position:sticky;bottom:0;background:#000;padding:10px 0;display:flex;gap:8px}
@@ -566,7 +566,7 @@ function showNewChatMessages(){
 function chatBubble(m, channelId){
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
-  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="">`;
+  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}"${m.pw && m.ph ? ` width="${m.pw}" height="${m.ph}"` : ''} loading="lazy" alt="">`;
   if (m.kind === 'video') {
     const thumb = m.has_thumb
       ? `<img src="${WEB_BASE}/thumb/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`

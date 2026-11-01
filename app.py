@@ -862,6 +862,19 @@ def _message_info(msg):
         kind = "document"
     else:
         kind = "text"
+    # 照片尺寸：前端用 width/height 属性先把位置占好，图片后加载时高度不变，
+    # 否则先只显示日期，图片一到就把下面内容顶下去，加载更早消息时就会跳。
+    # 没尺寸的照片（极少）就返回空，前端按老样子显示，仍可能轻微跳一下。
+    pw = ph = None
+    if msg.photo:
+        try:
+            sizes = [s for s in (msg.photo.sizes or [])
+                     if getattr(s, "w", None) and getattr(s, "h", None)]
+            if sizes:
+                best = max(sizes, key=lambda s: s.w * s.h)
+                pw, ph = best.w, best.h
+        except Exception:
+            pw = ph = None
     return {"msg_id": msg.id,
             "kind": kind,
             "text": (msg.text or "")[:2000],
@@ -871,6 +884,8 @@ def _message_info(msg):
             "duration": duration,
             "filename": filename,
             "has_thumb": bool(doc is not None and getattr(doc, "thumbs", None)),
+            "pw": pw,
+            "ph": ph,
             "buttons": _inline_buttons(msg)}
 
 
