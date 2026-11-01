@@ -104,11 +104,15 @@ a.kb-btn{display:block}
    这样播放器框底边和按钮之间总有空隙，按钮不会压住进度条的时间文字。 */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px}
 .modal-box{width:100%;max-width:1600px;position:relative}
-/* 单手用手机时：播放器沉到底部，进度条就在拇指附近，不用够到屏幕中间去拖。
+/* 单手用手机时：播放器沉到底部附近，进度条就在拇指附近，不用够到屏幕中间去拖。
    只在触屏或窄屏上这样，电脑鼠标能轻松点中间，电脑上还是居中，不会变得很怪。
-   底部 64px 的空还是给关闭按钮留的，进度条不会被按钮压住。 */
-@media (pointer: coarse), (max-width: 768px) {
+   底部 64px 的空还是给关闭按钮留的，进度条不会被按钮压住。
+   上次直接沉到底嫌太低了，这次往上移半个播放器框高：框本身 translateY(-50%)，
+   也就是框高的一半，进度条从贴底边升到屏幕下半段中间，拇指还能够到，又不至于太低。
+   只在竖屏上这样，横屏高度本来就不够，再往上移会把视频顶出屏幕，横屏还是居中。 */
+@media (pointer: coarse) and (orientation: portrait), (max-width: 768px) and (orientation: portrait) {
   .modal{align-items:flex-end}
+  .modal-box{transform:translateY(-50%)}
 }
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
@@ -202,7 +206,7 @@ a.kb-btn{display:block}
 <!-- 第四步：点击频道进入的新页面：该频道视频 -->
 <div id="channelView" class="hidden">
   <div class="sticky-header">
-    <button class="back-btn" onclick="backToChannels()">← 返回所有频道</button>
+    <button class="back-btn" onclick="backToChannels()">← 返回</button>
     <h2 id="channelTitle">频道</h2>
     <button class="toggle-btn" onclick="switchToChat()">聊天</button>
     <button class="toggle-btn active">视频</button>
@@ -219,7 +223,7 @@ a.kb-btn{display:block}
 <div id="chatView" class="hidden">
   <div class="chat-wrap">
   <div class="sticky-header">
-    <button class="back-btn" onclick="backToChannels()">← 返回所有频道</button>
+    <button class="back-btn" onclick="backToChannels()">← 返回</button>
     <h2 id="chatTitle">聊天</h2>
     <button class="toggle-btn active">聊天</button>
     <button class="toggle-btn" onclick="switchToVideo()">视频</button>
@@ -349,9 +353,23 @@ function linkify(s){
   out = out.replace(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{4,})/g, (m,pre,u)=>`${pre}<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">@${u}</a>`);
   return out;
 }
+// 返回栈：从机器人/频道里点链接进新频道时，把当前频道压栈，返回时先回栈顶，
+// 栈空了才回全部频道列表。聊天/视频切换是同一个频道内换页，不压栈，
+// 所以从新频道点返回不会回到同一个频道的前一个页，而是回到机器人。
+let navStack = [];
+function currentViewKind(){
+  if (!document.getElementById('chatView').classList.contains('hidden')) return 'chat';
+  if (!document.getElementById('channelView').classList.contains('hidden')) return 'video';
+  return 'chat';
+}
+function pushNavStack(){
+  if (!currentChannelId) return;
+  navStack.push({id: currentChannelId, title: currentChannelTitle, username: currentChannelUsername, view: currentViewKind()});
+}
 async function openChannelLink(username, msgId){
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
+    if (currentChannelId && currentChannelId !== d.id) pushNavStack();
     await loadChat(d.id, d.title||username, d.username||username);
     if (msgId) await jumpToChatMessage(Number(msgId));
   }catch(e){ alert(e.message); }
@@ -651,6 +669,15 @@ document.getElementById('playerModal').addEventListener('dblclick', e=>{
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePlayer(); });
 function backToChannels(){
   closePlayer();
+  // 栈里有上一页就回上一页（比如机器人里点链接进了频道，就回机器人），
+  // 栈空了才回全部频道列表。按钮文字也因此改成“返回”，不再写“返回所有频道”，
+  // 因为返回的目的地不一定是全部频道列表。
+  if (navStack.length) {
+    const prev = navStack.pop();
+    if (prev.view === 'video') { loadVideos(prev.id, prev.title, prev.username); }
+    else { loadChat(prev.id, prev.title, prev.username); }
+    return;
+  }
   currentChannelId = null;
   showView('channelsView');
   loadChannels();
@@ -1150,14 +1177,18 @@ document.getElementById('searchResults').addEventListener('click', e=>{
   const username = item.dataset.username || '';
   if (btn) {
     if (btn.dataset.action === 'join') { joinChannel(btn.dataset.ch); return; }
+    // 从全部频道列表点进来是新的起点，不是链接链，栈要清空，返回时才直接回列表
+    navStack = [];
     if (btn.dataset.action === 'chat') { loadChat(id, title, username); return; }
     if (btn.dataset.action === 'video') { loadVideos(id, title, username); return; }
   }
+  navStack = [];
   loadChat(id, title, username);
 });
 document.getElementById('channels').addEventListener('click', e=>{
   const card = e.target.closest('.channel-card');
   if (!card) return;
+  navStack = [];
   loadChat(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '');
 });
 refreshStatus();
