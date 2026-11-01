@@ -94,6 +94,11 @@ show_status() {
   echo "api_hash：$(mask_hash "$hash")"
   if [ -f "$APP_DIR/data/tg.session" ]; then
     echo "登录 session：已存在（data/tg.session）"
+    _mode="$(stat -c %a "$APP_DIR/data/tg.session" 2>/dev/null || echo "?")"
+    if [ "$_mode" != "600" ]; then
+      chmod 600 "$APP_DIR/data/tg.session" 2>/dev/null || true
+      echo "注意：session 文件权限原来是 $_mode，已改成 600（只有 root 能读，拿走它就不用验证码能登你的号，别外传备份）。"
+    fi
   else
     echo "登录 session：不存在（还没在网页上登录过）"
   fi
@@ -169,6 +174,9 @@ do_reset_web_password() {
   if python3 -c 'import sys; pw=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in pw for c in bad) or any(c.isspace() for c in pw) else 1)' "$pw"; then
     echo "密码不能含美元符、井号、单引号、双引号、空格、反斜杠，否则 .env 会被 docker compose 认错，导致实际密码和显示的不一样。请换一个不含这些字符的密码。"
     return 1
+  fi
+  if [ "${#pw}" -lt 12 ]; then
+    echo "注意：这个密码不到 12 位，很容易被猜到。建议用安装时自动生成的 16 位随机密码，或者重新设一个长的。"
   fi
   if [ "$from_arg" = "1" ]; then
     echo "注意：命令行里写的密码会留在 shell 历史里，下次请不带参数交互输入。"

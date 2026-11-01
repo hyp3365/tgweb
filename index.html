@@ -98,7 +98,7 @@ a.kb-btn{display:block}
 <div class="wrap">
 <div class="topbar">
   <span id="status" class="muted" style="font-size:12px;line-height:1.4">正在检查登录状态…</span>
-  <button id="logoutBtn" class="hidden" onclick="logout()">退出账号</button>
+  <span><button id="logoutBtn" class="hidden" onclick="logout()">退出账号</button><button onclick="webLogout()">退出网页登录</button></span>
 </div>
 
 <!-- 网页密码通过后，先进入这个检查页，再决定去登录页还是频道页 -->
@@ -326,6 +326,7 @@ async function submitPassword(){
     alert('登录成功'); await refreshStatus();
   }catch(e){ alert(e.message); }
 }
+async function webLogout(){ try{ await api('/api/web-logout',{method:'POST'}); }catch(e){} showGate(); }
 async function logout(){ try{ await api('/api/logout',{method:'POST'}); }catch(e){} await refreshStatus(); }
 let searchResultsCache = [];
 let searchPage = 0;
@@ -613,7 +614,7 @@ async function clickInlineBtn(channelId, msgId, row, col){
   }
   try{
     const d = await api('/api/callback',{method:'POST', body:JSON.stringify({channel_id: channelId, msg_id: msgId, row, col, username: currentChannelUsername || null})});
-    if (d.url) window.open(d.url, '_blank');
+    if (d.url) { if (/^https?:\/\//.test(d.url)) window.open(d.url, '_blank'); else alert('这个链接不是 http/https，已拦截：' + d.url); }
     else if (d.alert) alert(d.alert);
     // 机器人点完按钮一般会改原消息或发新消息（比如下一页），等一下再刷新聊天就能看到
     setTimeout(()=>{

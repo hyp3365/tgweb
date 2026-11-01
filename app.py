@@ -31,6 +31,36 @@ _client_lock = asyncio.Lock()
 _entity_lock = asyncio.Lock()
 
 app = FastAPI(title="app", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    # 不加 CSP default-src：页面用了内联 script，严格 CSP 会直接打断；只加不会打断的防 framing / 嗅探头
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return resp
+
+
+def _chmod_session():
+    for path in (SESSION_PATH, SESSION_PATH + "-journal"):
+        try:
+            if path and __import__("os").path.exists(path):
+                __import__("os").chmod(path, 0o600)
+        except Exception:
+            pass
+
+
+def _client_ip(request):
+    # 只信任回环代理（nginx 在本机）带来的 X-Real-IP：nginx 是用 $remote_addr 覆盖写这个头的，伪造不了；
+    # X-Forwarded-For 是追加的，第一个值就是攻击者自己填的，绝不能当 IP 用。
+    # 非回环直连时一律用真实连接 IP，不认任何头。
+    host = request.client.host if request.client else None
+    if host in ("127.0.0.1", "::1"):
+        return request.headers.get("x-real-ip", "").strip() or host
+    return host or "unknown"
 _client: TelegramClient | None = None
 _login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}
 
@@ -55,6 +85,7 @@ async def get_client() -> TelegramClient:
             _client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
         if not _client.is_connected():
             await _client.connect()
+        _chmod_session()
         return _client
 
 
@@ -111,10 +142,23 @@ class WebLoginIn(BaseModel):
 async def web_login(request: Request, body: WebLoginIn):
     if not WEB_PASSWORD:
         raise HTTPException(status_code=401, detail="网页密码未设置，请在服务器上用 tg reset-password 设置一个")
-    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = _client_ip(request)
     now = time.time()
-    attempts = [ts for ts in _web_attempts.get(ip, []) if now - ts < 600]
-    _web_attempts[ip] = attempts
+    # 失败记录加上限：先清掉过期/空的，超过 1000 个 IP 就删掉最旧的一半，防止伪造 IP 撑大字典耗内存
+    for k in list(_web_attempts.keys()):
+        v = [ts for ts in _web_attempts[k] if now - ts < 600]
+        if v:
+            _web_attempts[k] = v
+        else:
+            _web_attempts.pop(k, None)
+    if len(_web_attempts) > 1000:
+        for k in sorted(_web_attempts.keys(), key=lambda x: min(_web_attempts[x]) if _web_attempts[x] else 0)[:500]:
+            _web_attempts.pop(k, None)
+    if len(_web_sessions) > 100:
+        for k in list(_web_sessions.keys()):
+            if _web_sessions[k] < now:
+                _web_sessions.pop(k, None)
+    attempts = _web_attempts.get(ip, [])
     if len(attempts) >= 5:
         raise HTTPException(status_code=429, detail="尝试太多次，请 10 分钟后再试")
     if not secrets.compare_digest(body.password or "", WEB_PASSWORD):
@@ -203,6 +247,17 @@ async def login_password(request: Request, body: PasswordIn):
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
     return {"ok": True, "logged_in": True}
+
+
+@app.post("/api/web-logout")
+async def web_logout(request: Request):
+    check_web_auth(request)
+    token = request.cookies.get("web_token")
+    if token:
+        _web_sessions.pop(token, None)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("web_token", "", max_age=0, path="/", httponly=True, samesite="lax")
+    return resp
 
 
 @app.post("/api/logout")

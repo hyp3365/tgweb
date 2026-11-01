@@ -5,6 +5,7 @@ set -e
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   echo "用法：bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh)"
   echo "安装目录：\${TGWEB_DIR:-/root/telegram-stream}，已有 .env 不会被覆盖，改配置用 tg 命令。"
+  echo "安装后必须绑定域名或有证书的 IP，不提供 HTTP 访问；证书要先放在 /root/cert/<域名或IP>/ 里，或用 TGWEB_DOMAIN 环境变量指定要绑的域名/IP。"
   exit 0
 fi
 REPO="https://github.com/hyp3365/tgweb.git"
@@ -90,55 +91,73 @@ if curl -fsS http://127.0.0.1:8000/ >/dev/null 2>&1; then
 else
   echo "服务启动检查失败，请在 $DIR 里看 docker compose logs。"
 fi
-# 8000 只绑回环，不直接对公网开放；80 口走 nginx 反代，tg domain 绑域名后 HTTPS 才不会被 8000 直连绕过
-NGINX_OK=0
-if grep -rq "proxy_pass http://127.0.0.1:8000" /etc/nginx/ 2>/dev/null; then
-  echo "检测到已有 Nginx 反代到 8000，跳过 Nginx 配置。"
-  NGINX_OK=1
-else
-  if ! command -v nginx >/dev/null 2>&1; then
-    apt-get install -y nginx 2>/dev/null || true
+# 8000 只绑回环，不直接对公网开放；不提供 HTTP 访问：安装后必须绑定域名或有证书的 IP，走 HTTPS 才能进应用
+# 旧的 HTTP 反代必须删掉，否则 HTTPS 会被 HTTP 明文绕过
+rm -f /etc/nginx/conf.d/tgweb.conf
+if ! command -v nginx >/dev/null 2>&1; then
+  apt-get install -y nginx 2>/dev/null || true
+fi
+# 已有 HTTPS 站点（tg domain 绑过的域名，或原来 IP 的 HTTPS 站）就保留不动，不用重新绑
+if grep -rq "listen 443 ssl" /etc/nginx/ 2>/dev/null && grep -rq "proxy_pass http://127.0.0.1:8000" /etc/nginx/ 2>/dev/null; then
+  echo "检测到已有 HTTPS 站点，保留不动，继续用原来的 https 地址访问。"
+  if [ -n "$NEW_PW" ]; then
+    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
+  else
+    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
   fi
-  if command -v nginx >/dev/null 2>&1; then
-    cat > /etc/nginx/conf.d/tgweb.conf <<'NGINXEOF'
-server {
-    listen 80;
-    server_name _;
-    server_tokens off;
-    client_max_body_size 0;
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-NGINXEOF
-    if nginx -t 2>/dev/null; then
-      systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null || true
-      NGINX_OK=1
-    else
-      rm -f /etc/nginx/conf.d/tgweb.conf
-      echo "Nginx 配置检查失败，已跳过反代，服务只能从本机 127.0.0.1:8000 访问。"
-    fi
+  exit 0
+fi
+if ! command -v nginx >/dev/null 2>&1; then
+  echo "Nginx 未装好，无法建 HTTPS 站点。服务只在 127.0.0.1:8000 运行，不提供 HTTP 访问。"
+  echo "装好 Nginx、准备好证书后，运行 tg domain <域名或IP> 绑定。"
+  exit 1
+fi
+BIND_NAME="${TGWEB_DOMAIN:-}"
+if [ -z "$BIND_NAME" ] && [ -t 0 ]; then
+  read -r -p "要绑定的域名或 IP（证书要已在 /root/cert/<域名或IP>/ 里，留空则不绑定）： " BIND_NAME || true
+fi
+BIND_NAME="$(echo "$BIND_NAME" | tr -d '[:space:]')"
+if [ -z "$BIND_NAME" ]; then
+  echo ""
+  echo "未绑定域名或 IP 证书，外部访问未开通：服务只在 127.0.0.1:8000 运行，不提供 HTTP 访问。"
+  echo "请把证书放到 /root/cert/<域名或IP>/fullchain.pem 和 privkey.pem，然后运行 tg domain <域名或IP> 绑定，再用 https://<域名或IP> 访问。"
+  if [ -d /root/cert ] || [ -d /etc/nginx/cert ]; then
+    echo "本机已有证书："
+    for d in /root/cert/* /etc/nginx/cert/*; do
+      if [ -f "$d/fullchain.pem" ] && [ -f "$d/privkey.pem" ]; then echo "  $(basename "$d")"; fi
+    done 2>/dev/null || true
   fi
+  if [ -n "$NEW_PW" ]; then
+    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
+  else
+    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
+  fi
+  exit 1
 fi
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-[ -z "$IP" ] && IP="服务器IP"
-echo ""
-if [ "$NGINX_OK" = "1" ]; then
-  echo "访问地址：http://$IP/"
+if [ -f "/root/cert/$BIND_NAME/fullchain.pem" ] && [ -f "/root/cert/$BIND_NAME/privkey.pem" ]; then
+  :
+elif [ -f "/etc/nginx/cert/$BIND_NAME/fullchain.pem" ] && [ -f "/etc/nginx/cert/$BIND_NAME/privkey.pem" ]; then
+  :
 else
-  echo "访问地址：http://127.0.0.1:8000（仅本机，请自行配反代）"
+  echo ""
+  echo "域名/IP $BIND_NAME 的证书不存在：/root/cert/$BIND_NAME/ 或 /etc/nginx/cert/$BIND_NAME/ 里要有 fullchain.pem 和 privkey.pem。"
+  echo "安装不会提供 HTTP 访问。请准备好证书后运行 tg domain $BIND_NAME 绑定（tg domain 还能用泛域名/父域名证书），再用 https://$BIND_NAME 访问。"
+  if [ -n "$NEW_PW" ]; then
+    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
+  else
+    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
+  fi
+  exit 1
 fi
-if [ -n "$NEW_PW" ]; then
-  echo "网页密码（刚生成的，请记下来）：$NEW_PW"
+if /usr/local/bin/tg-domain "$BIND_NAME"; then
+  echo ""
+  echo "访问地址：https://$BIND_NAME"
+  if [ -n "$NEW_PW" ]; then
+    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
+  else
+    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
+  fi
 else
-  echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
+  echo "绑定 $BIND_NAME 失败，外部访问未开通，不提供 HTTP 访问。"
+  exit 1
 fi
-echo "如需 HTTPS，用 tg domain 绑定域名。"

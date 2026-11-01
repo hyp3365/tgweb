@@ -2,6 +2,7 @@
 # tgweb 域名（tg domain 调用，也可直接用 tg-domain）：直接列出本机已有证书的域名，选一个就把域名和证书写进 Nginx 配置并重载；再运行就换域名。
 # 证书目录：/root/cert/<域名>/ 或 /etc/nginx/cert/<域名>/，里面要有 fullchain.pem 和 privkey.pem。
 # 生成的配置：/etc/nginx/conf.d/tgweb-domain.conf，只有一份，换域名就覆盖（反代本机 127.0.0.1:8000 的网页服务）。
+# 只生成 443，不生成 80：禁止用 HTTP 访问应用，绑了域名/IP 后 HTTP 入口必须关掉，否则 HTTPS 会被绕过。
 # TGWEB-DOMAIN-TOOL（安装器靠这行识别 /usr/local/bin/tg-domain 是不是本工具）
 set -uo pipefail
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -164,7 +165,8 @@ backup=""
 
 if [[ $rc == 2 ]]; then
     rm -f "$CONF"
-    reload_or_rollback "$backup" && green "已取消域名（证书文件没动）。"
+    rm -f /etc/nginx/conf.d/tgweb.conf
+    reload_or_rollback "$backup" && green "已取消域名，外部访问已关闭（不再提供 HTTP 访问，证书文件没动）。请重新用 tg domain 绑定域名或 IP 证书才能访问。"
     exit
 fi
 
@@ -176,6 +178,8 @@ if [[ -n "$other" ]]; then
     echo "$other" | sed 's/^/  /'
 fi
 
+# 旧的 HTTP 反代必须删掉，否则绑了 HTTPS 也能用 HTTP 明文进应用
+rm -f /etc/nginx/conf.d/tgweb.conf
 cat > "$CONF" <<EOF
 # tgweb 域名（由 tg domain 生成；再运行 tg domain 可换域名）
 server {
@@ -199,12 +203,6 @@ server {
         proxy_send_timeout 3600s;
         client_max_body_size 0;
     }
-}
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-    return 301 https://\$host\$request_uri;
 }
 EOF
 olds=( ${OLD_PREFIX}*.conf ); old_bak=$(mktemp -d)
