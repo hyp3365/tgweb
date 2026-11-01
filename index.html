@@ -95,13 +95,19 @@ a.kb-btn{display:block}
    框最大宽 900px→1600px。按 1920 宽的屏幕算，两边原来约 526px，
    现在约 164px，降了约 69%，接近 75%；手机上两边就是 16px→4px，正好 75%。
    不同屏幕宽算出来的百分比不一样，没法所有屏幕都正好 75%，所以按这个办法做。
-   视频高还是最多 80vh，16:9 的视频高到顶后宽会跟着收一点，这是高限制，不是框没拉大。 */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px}
+   视频高还是最多 80vh，16:9 的视频高到顶后宽会跟着收一点，这是高限制，不是框没拉大。
+   关闭按钮固定在屏幕底部居中，不放在播放器框里：之前放框下面、靠右，
+   正好落在右半边双击快进的区域里，双击快进时容易误点成关闭。
+   现在放屏幕底边中间，左右快进区在它两边，中间本来就是左右分界，不会挡快进；
+   双击按钮本身还是被双击处理排除的，不会触发快进。
+   弹窗底部内边距留 64px 给这个按钮（按钮高约 35px + 离底边 16px + 空隙），
+   这样播放器框底边和按钮之间总有空隙，按钮不会压住进度条的时间文字。 */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px}
 .modal-box{width:100%;max-width:1600px;position:relative}
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
 .modal-box video{width:100%;max-height:80vh;background:#000;border-radius:12px}
-.modal-close{display:block;margin:10px 0 0 auto;padding:7px 14px;font-size:14px}
+.modal-close{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:101;margin:0;padding:7px 14px;font-size:14px}
 /* 原生进度条去掉：浏览器自带的 controls 是一整套，没法只关其中一条，
    只能用 WebKit 的伪元素把时间轴藏起来，播放/音量/全屏这些按钮还在。
    这招只在 Chrome/Safari 这类 WebKit 浏览器生效，Firefox 不支持这种伪元素，
@@ -253,9 +259,9 @@ a.kb-btn{display:block}
       </div>
       <div class="player-progress-time"><span id="playerTimeCur">0:00</span><span id="playerTimeDur">0:00</span></div>
     </div>
-    <button class="modal-close" onclick="closePlayer()">× 关闭</button>
     <div id="seekFeedback" class="seek-feedback"></div>
   </div>
+  <button class="modal-close" onclick="closePlayer()">× 关闭</button>
 </div>
 
 <script>
