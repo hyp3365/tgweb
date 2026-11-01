@@ -449,6 +449,66 @@ async def thumb(request: Request, channel_id: int, msg_id: int, username: str | 
 
 
 # ---------- 聊天模式：全部消息（不只是视频）+ 发文字 ----------
+
+def _inline_buttons(msg):
+    # Telethon 1.45: msg.buttons 是 MessageButton 列表的列表，text / data / url / inline_query 都现成
+    try:
+        btns = getattr(msg, "buttons", None)
+        if btns:
+            rows = []
+            for row in btns:
+                r = []
+                for b in row:
+                    text = getattr(b, "text", "") or ""
+                    data = getattr(b, "data", None)
+                    url = getattr(b, "url", None)
+                    query = getattr(b, "inline_query", None)
+                    if data is not None:
+                        typ = "callback"
+                    elif url:
+                        typ = "url"
+                    elif query is not None:
+                        typ = "switch"
+                    else:
+                        typ = "other"
+                    r.append({"text": text, "type": typ, "url": url, "query": query})
+                rows.append(r)
+            return rows
+    except Exception:
+        pass
+    # 旧版 reply_markup 兜底
+    try:
+        markup = getattr(msg, "reply_markup", None)
+        rows = getattr(markup, "rows", None) if markup else None
+        if rows:
+            out = []
+            for row in rows:
+                r = []
+                for b in getattr(row, "buttons", []):
+                    text = getattr(b, "text", "") or ""
+                    typ = "other"; url = None; query = None
+                    bt = getattr(b, "type", None)
+                    if bt is not None:
+                        cls = type(bt).__name__
+                        if "Callback" in cls:
+                            typ = "callback"
+                        elif "Url" in cls:
+                            typ = "url"; url = getattr(bt, "url", None)
+                        elif "SwitchInline" in cls:
+                            typ = "switch"; query = getattr(bt, "query", None)
+                    else:
+                        if getattr(b, "data", None) is not None:
+                            typ = "callback"
+                        elif getattr(b, "url", None):
+                            typ = "url"; url = b.url
+                    r.append({"text": text, "type": typ, "url": url, "query": query})
+                out.append(r)
+            return out
+    except Exception:
+        pass
+    return []
+
+
 def _message_info(msg):
     doc = msg.video or msg.document
     duration = None
@@ -475,7 +535,8 @@ def _message_info(msg):
             "mime": doc.mime_type if doc is not None else None,
             "duration": duration,
             "filename": filename,
-            "has_thumb": bool(doc is not None and getattr(doc, "thumbs", None))}
+            "has_thumb": bool(doc is not None and getattr(doc, "thumbs", None)),
+            "buttons": _inline_buttons(msg)}
 
 
 @app.get("/api/messages")
@@ -520,6 +581,35 @@ async def search_messages(request: Request, channel_id: int, q: str, limit: int 
         out = out[:limit]
     return {"messages": out, "has_more": has_more,
             "next_offset_id": out[-1]["msg_id"] if has_more and out else None}
+
+
+class CallbackIn(BaseModel):
+    channel_id: int
+    msg_id: int
+    row: int
+    col: int
+    username: str | None = None
+
+
+@app.post("/api/callback")
+async def callback(request: Request, body: CallbackIn):
+    check_web_auth(request)
+    client = await require_login()
+    entity = await _channel_entity(client, body.channel_id, body.username)
+    msg = await client.get_messages(entity, ids=body.msg_id)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="找不到这条消息")
+    try:
+        result = await msg.click(i=body.row, j=body.col)
+    except Exception as e:
+        if "Timeout" in type(e).__name__ or "timeout" in str(e).lower():
+            return {"ok": True, "timeout": True}
+        raise HTTPException(status_code=400, detail=f"点击失败：{str(e)[:200]}")
+    if isinstance(result, str):
+        return {"ok": True, "url": result}
+    if result is None:
+        return {"ok": True}
+    return {"ok": True, "alert": getattr(result, "message", None), "url": getattr(result, "url", None)}
 
 
 class SendIn(BaseModel):

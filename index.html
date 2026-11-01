@@ -73,6 +73,10 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 .toggle-btn.active{background:#fff;color:#000;border-color:#fff}
 .toggle-btn:not(.active){background:#1a1a1a;color:#ddd;border-color:#333}
 #chatLoadMoreBtn{height:28px;padding:4px 14px;font-size:13px;line-height:1.4}
+.inline-kb{margin-top:10px}
+.kb-row{display:flex;gap:6px;margin-bottom:6px}
+.kb-btn{flex:1;background:#2f9e44;color:#fff;border-color:#2f9e44;padding:10px 4px;font-size:14px;margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;text-decoration:none}
+a.kb-btn{display:block}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
 .modal-box{width:100%;max-width:900px}
 .modal-box video{width:100%;max-height:80vh;background:#000;border-radius:12px}
@@ -469,6 +473,13 @@ function chatBubble(m, channelId){
   }
   if (m.kind === 'document') body += `<div class="muted">[文件] ${esc(m.filename || '')} ${fmtSize(m.size)}</div>`;
   if (!body) body = '<div class="muted">[这条消息没有文字]</div>';
+  if (m.buttons && m.buttons.length) {
+    kbCache[m.msg_id] = m.buttons;
+    body += `<div class="inline-kb">` + m.buttons.map((row, ri) => `<div class="kb-row">` + row.map((b, ci) => {
+      if (b.type === 'url' && b.url) return `<a class="kb-btn" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.text)}</a>`;
+      return `<button class="kb-btn" onclick="clickInlineBtn(${channelId},${m.msg_id},${ri},${ci})">${esc(b.text)}</button>`;
+    }).join('') + `</div>`).join('') + `</div>`;
+  }
   return `<div class="chat-msg"><div class="chat-meta">${m.date?new Date(m.date).toLocaleString():''}</div>${body}</div>`;
 }
 async function loadChat(channelId, title, username=''){
@@ -591,6 +602,30 @@ async function sendChatMessage(){
 }
 document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChatMessage(); });
 
+let kbCache = {};
+async function clickInlineBtn(channelId, msgId, row, col){
+  const btn = (kbCache[msgId] || [])[row] ? kbCache[msgId][row][col] : null;
+  if (!btn) return;
+  if (btn.type === 'switch' && btn.query) {
+    const inp = document.getElementById('chatSearchInput');
+    if (inp) { inp.value = btn.query; searchChatMessages(); }
+    return;
+  }
+  try{
+    const d = await api('/api/callback',{method:'POST', body:JSON.stringify({channel_id: channelId, msg_id: msgId, row, col, username: currentChannelUsername || null})});
+    if (d.url) window.open(d.url, '_blank');
+    else if (d.alert) alert(d.alert);
+    // 机器人点完按钮一般会改原消息或发新消息（比如下一页），等一下再刷新聊天就能看到
+    setTimeout(()=>{
+      chatSearching = false; chatSearchQ = ''; chatSearchOffset = 0; chatSearchHasMore = false;
+      const csi = document.getElementById('chatSearchInput'); if (csi) csi.value = '';
+      document.getElementById('clearChatSearchBtn').classList.add('hidden');
+      document.getElementById('chatSearchNextWrap').classList.add('hidden');
+      chatOldestId = 0; chatHasMore = false;
+      loadChatPage(false);
+    }, 800);
+  }catch(e){ alert(e.message); }
+}
 function playVideo(channelId, msgId){
   // 只弹出播放器，不滚动页面、不移动列表位置
   const p = document.getElementById('player');
