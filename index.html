@@ -46,6 +46,7 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 .channel-actions button{padding:6px 12px;font-size:13px;margin:0}
 .chat-wrap{max-width:760px;margin:0 auto}
 .chat-msg{background:#111;border:1px solid #222;border-radius:12px;padding:10px 12px;margin:10px 0}
+.chat-msg.highlight{border-color:#888;background:#1e1e1e}
 .chat-msg .chat-meta{color:#888;font-size:12px;margin-bottom:4px}
 .chat-msg img{max-width:100%;height:auto;border-radius:8px;display:block;margin-top:6px;background:#111}
 .chat-thumb{position:relative;max-width:320px;aspect-ratio:16/9;background:#111;border-radius:8px;overflow:hidden;cursor:pointer;margin-top:6px}
@@ -270,15 +271,39 @@ function fmtDur(s){ if(s==null) return ''; s = Math.round(s); return Math.floor(
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function linkify(s){
   // s 已经是 esc 过的文本：把 t.me/用户名 和 @用户名 变成可点链接，点开就是新频道/群组
-  let out = s.replace(/https?:\/\/t\.me\/(?!c\/|s\/|joinchat|\+)([A-Za-z0-9_]+)/g, (m,u)=>`<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">${m}</a>`);
+  // t.me/用户名/消息号 也要整个放进链接里，消息号不能丢，点开后要跳到那条消息
+  let out = s.replace(/https?:\/\/t\.me\/(?!c\/|s\/|joinchat|\+)([A-Za-z0-9_]+)(?:\/(\d+))?/g, (m,u,mid)=>`<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}'${mid ? `,${mid}` : ''})">${m}</a>`);
   out = out.replace(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{4,})/g, (m,pre,u)=>`${pre}<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">@${u}</a>`);
   return out;
 }
-async function openChannelLink(username){
+async function openChannelLink(username, msgId){
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
-    loadChat(d.id, d.title||username, d.username||username);
+    await loadChat(d.id, d.title||username, d.username||username);
+    if (msgId) await jumpToChatMessage(Number(msgId));
   }catch(e){ alert(e.message); }
+}
+function highlightChatMessage(el){
+  if (!el) return;
+  el.classList.add('highlight');
+  setTimeout(()=>{ el.classList.remove('highlight'); }, 3000);
+}
+async function jumpToChatMessage(msgId){
+  // 先在已经加载的消息里找，找不到就往更早翻，最多再翻 10 页（300 条），
+  // 再找不到就停在频道里，用户可以继续点“加载更早的消息”手动找
+  for (let i = 0; i <= 10; i++) {
+    const el = document.querySelector(`.chat-msg[data-msg-id="${msgId}"]`);
+    if (el) {
+      el.scrollIntoView({behavior:'smooth', block:'center'});
+      highlightChatMessage(el);
+      return true;
+    }
+    if (!chatHasMore) break;
+    await loadOlderChat();
+  }
+  const el = document.querySelector(`.chat-msg[data-msg-id="${msgId}"]`);
+  if (el) { el.scrollIntoView({behavior:'smooth', block:'center'}); highlightChatMessage(el); return true; }
+  return false;
 }
 async function webLogin(){
   const pw = document.getElementById('webPw').value;
@@ -552,8 +577,12 @@ let chatOldestId = 0;
 let chatHasMore = false;
 let chatLoading = false;
 let chatDisplayedIds = new Set();
+let chatMsgHash = {};
 let chatNewestId = 0;
 let chatUnreadCount = 0;
+function msgHash(m){
+  return JSON.stringify([m.text||'', m.kind||'', m.buttons||[], m.duration||null, m.filename||'', m.size||null]);
+}
 function hideChatNewMsgBar(){
   const b = document.getElementById('chatNewMsgBar');
   if (b) b.classList.add('hidden');
@@ -582,7 +611,7 @@ function chatBubble(m, channelId){
       return `<button class="kb-btn" onclick="clickInlineBtn(${channelId},${m.msg_id},${ri},${ci})">${esc(b.text)}</button>`;
     }).join('') + `</div>`).join('') + `</div>`;
   }
-  return `<div class="chat-msg"><div class="chat-meta">${m.date?new Date(m.date).toLocaleString():''}</div>${body}</div>`;
+  return `<div class="chat-msg" data-msg-id="${m.msg_id}"><div class="chat-meta">${m.date?new Date(m.date).toLocaleString():''}</div>${body}</div>`;
 }
 async function loadChat(channelId, title, username=''){
   currentChatChannelId = channelId;
@@ -599,7 +628,7 @@ async function loadChat(channelId, title, username=''){
   document.getElementById('clearChatSearchBtn').classList.add('hidden');
   document.getElementById('chatSearchNextWrap').classList.add('hidden');
   chatOldestId = 0; chatHasMore = false;
-  chatDisplayedIds = new Set(); chatNewestId = 0; hideChatNewMsgBar();
+  chatDisplayedIds = new Set(); chatMsgHash = {}; chatNewestId = 0; hideChatNewMsgBar();
   showView('chatView');
   window.scrollTo({top:0,behavior:'smooth'});
   await loadChatPage(false);
@@ -617,10 +646,13 @@ async function loadChatPage(appendOlder){
       box.innerHTML = d.messages.length ? chronological.map(m=>chatBubble(m, currentChatChannelId)).join('')
         : '<div class="muted">这个频道还没有消息。</div>';
       chatDisplayedIds = new Set(chronological.map(m=>m.msg_id));
+      chatMsgHash = {};
+      chronological.forEach(m=>{ chatMsgHash[m.msg_id] = msgHash(m); });
       chatNewestId = chronological.length ? Math.max(...chronological.map(m=>m.msg_id)) : 0;
       hideChatNewMsgBar();
       window.scrollTo({top:document.body.scrollHeight, behavior:'auto'});
     } else if (d.messages.length) {
+      chronological.forEach(m=>{ chatMsgHash[m.msg_id] = msgHash(m); });
       // 加载更早的消息：新消息在上面，旧位置不动，往上滑就能看到新消息。
       // 以前是直接跳到最顶，要往下滑一堆才能回到原来的位置，现在锚定原来的位置：
       // 先记下加载前的页面高度和滚动位置，插完新消息后把滚动位置往下补同样高度，
@@ -647,7 +679,10 @@ async function loadChatPage(appendOlder){
 async function loadOlderChat(){ await loadChatPage(true); }
 // 聊天自动刷新：每 3 秒查一次最新消息，不用退出重进就能看到频道/机器人的回复。
 // 只在聊天页可见、没在搜消息、没在看视频播放器、页面没切到后台时才查；
-// 查失败不弹窗，下一次再查。已经在屏幕上的消息按 id 去重，不会重复出现。
+// 查失败不弹窗，下一次再查。已经在屏幕上的消息按 id 去重，不会重复出现，
+// 但同一条消息被机器人改了（比如点了“下一页”后原消息换页），内容变了就原地更新，
+// 不用等手动重进，这就是以前下一页要十几秒的原因：800 毫秒那次刷新时机器人还没改完，
+// 之后轮询又把改过的消息当成已显示直接忽略了。
 // 如果你正在看底部的最新消息，新消息来了就自动滑到底部；
 // 如果你在往上翻旧消息，新消息会先贴在下面，不强制把你拉到底部，
 // 而是显示“有新消息，点击查看”，点了才滑到底部。
@@ -662,9 +697,17 @@ async function pollNewChatMessages(){
   try{
     const d = await api(`/api/messages?channel_id=${currentChatChannelId}&limit=30&offset_id=0` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
     const chronological = [...d.messages].reverse();
+    // 先处理改过的消息：id 已显示但文字/按钮变了，原地换掉，不滚动，不重复
+    chronological.forEach(m=>{
+      if (chatDisplayedIds.has(m.msg_id) && chatMsgHash[m.msg_id] !== msgHash(m)) {
+        const el = document.querySelector(`.chat-msg[data-msg-id="${m.msg_id}"]`);
+        if (el) el.outerHTML = chatBubble(m, currentChatChannelId);
+        chatMsgHash[m.msg_id] = msgHash(m);
+      }
+    });
     const fresh = chronological.filter(m=>!chatDisplayedIds.has(m.msg_id));
     if (!fresh.length) return;
-    fresh.forEach(m=>{ chatDisplayedIds.add(m.msg_id); if (m.msg_id > chatNewestId) chatNewestId = m.msg_id; });
+    fresh.forEach(m=>{ chatDisplayedIds.add(m.msg_id); chatMsgHash[m.msg_id] = msgHash(m); if (m.msg_id > chatNewestId) chatNewestId = m.msg_id; });
     const box = document.getElementById('chatMessages');
     if (box.textContent.includes('还没有消息')) box.innerHTML = '';
     box.insertAdjacentHTML('beforeend', fresh.map(m=>chatBubble(m, currentChatChannelId)).join(''));
@@ -750,6 +793,7 @@ async function sendChatMessage(){
     if (box.textContent.includes('还没有消息')) box.innerHTML = '';
     if (d.message && d.message.msg_id) {
       chatDisplayedIds.add(d.message.msg_id);
+      chatMsgHash[d.message.msg_id] = msgHash(d.message);
       if (d.message.msg_id > chatNewestId) chatNewestId = d.message.msg_id;
     }
     box.insertAdjacentHTML('beforeend', chatBubble(d.message, currentChatChannelId));
