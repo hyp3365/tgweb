@@ -374,7 +374,7 @@ async function loadChannels(){
     const d = await api('/api/channels');
     joinedIds = new Set(d.channels.map(c=>c.id));
     document.getElementById('channels').innerHTML = d.channels.length ? d.channels.map(c=>
-      `<div class="channel-card" data-id="${c.id}" data-title="${esc(c.title)}" data-username="${esc(c.username||'')}"><b>${esc(c.title)}</b><br>
+      `<div class="channel-card" data-id="${c.id}" data-title="${esc(c.title)}" data-username="${esc(c.username||'')}"><b>${esc(c.title)}</b>${c.type==='bot'?' <span class="muted">bot</span>':''}<br>
        <span class="muted">${c.username?'@'+esc(c.username):''}</span></div>`).join('')
       : '<div class="muted">还没有订阅，先搜索并添加一个。</div>';
   }catch(e){ /* 未登录时 refreshStatus 已处理 */ }

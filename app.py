@@ -19,7 +19,7 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Channel, Chat, DocumentAttributeFilename, DocumentAttributeVideo, PeerChannel, InputMessagesFilterVideo
+from telethon.tl.types import Channel, Chat, User, DocumentAttributeFilename, DocumentAttributeVideo, PeerChannel, InputMessagesFilterVideo
 
 API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "")
@@ -349,10 +349,17 @@ def _cache_entity(entity):
     if uname:
         _entity_cache_by_username[uname.lower()] = entity
 def _chat_info(entity):
+    # 机器人是 User 类型，不是 Channel/Chat：原来 type 一律算 chat，搜索里也分不出来。
+    if isinstance(entity, Channel):
+        typ = "channel"
+    elif isinstance(entity, User) and getattr(entity, "bot", False):
+        typ = "bot"
+    else:
+        typ = "chat"
     return {"id": getattr(entity, "id", None),
             "title": getattr(entity, "title", None) or getattr(entity, "first_name", ""),
             "username": getattr(entity, "username", None),
-            "type": "channel" if isinstance(entity, Channel) else "chat"}
+            "type": typ}
 
 
 @app.get("/api/search")
@@ -510,7 +517,12 @@ async def my_channels(request: Request):
     for dialog in await _get_dialogs(client):
         e = dialog.entity
         _cache_entity(e)
-        if isinstance(e, (Channel, Chat)) and e.id not in seen:
+        # 原来只算 Channel/Chat，机器人是 User，被过滤掉了：刚加入时靠内存里的 _recently_joined
+        # 临时顶在前面才看得到，服务一重启（重新 build、改密码、改路径都会重启容器）临时列表就清空，
+        # 机器人就从所有频道里消失了，但其实你从没离开过，消息当然还在。改成机器人也算上，
+        # 普通私聊 User 还是不算（只给自己用，不想把私聊都摊在列表里）。
+        is_bot = isinstance(e, User) and getattr(e, "bot", False)
+        if (isinstance(e, (Channel, Chat)) or is_bot) and e.id not in seen:
             seen.add(e.id)
             out.append(_chat_info(e))
     front = []
