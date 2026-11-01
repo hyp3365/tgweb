@@ -1,0 +1,247 @@
+#!/bin/bash
+# tg - 视频库的服务器快捷命令（终端用，不是网页）
+# 用法：
+#   tg                打开交互菜单
+#   tg status         只看当前配置状态（api_hash 只显示掩码，不显示完整值）
+#   tg set-id 12345   设置 api_id
+#   tg set-hash xxx   设置 api_hash
+#   tg del            删除 api 配置（清空 api_id / api_hash）
+#   tg reset-password [新密码]  重置网页密码（不给参数就交互输入）
+#   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
+#   tg restart        重启服务
+#   tg help           帮助
+# 改完 api_id / api_hash / 删除后会自动重启服务，不用再手动 docker compose。
+# api_hash 不走网页，只在服务器终端里输入，终端输入时不回显。
+APP_DIR="${TG_APP_DIR:-/root/telegram-stream}"
+if [ ! -d "$APP_DIR" ] && [ -d "$HOME/telegram-stream" ]; then
+  APP_DIR="$HOME/telegram-stream"
+fi
+ENV_FILE="$APP_DIR/.env"
+COMPOSE_FILE="$APP_DIR/docker-compose.yml"
+
+get_val() {
+  # 从 .env 里取某个键，不用 source，避免特殊字符出问题
+  grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
+set_val() {
+  # $1=键 $2=值，用 python 改写 .env，保留其它行，键不存在就追加
+  local key="$1" val="$2"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  touch "$ENV_FILE"
+  KEY="$key" VAL="$val" ENV_FILE="$ENV_FILE" python3 - << 'PY'
+import os
+key, val, path = os.environ["KEY"], os.environ["VAL"], os.environ["ENV_FILE"]
+lines = []
+found = False
+if os.path.exists(path):
+    with open(path) as f:
+        lines = f.read().splitlines()
+out = []
+for line in lines:
+    if line.startswith(key + "="):
+        if not found:
+            out.append(f"{key}={val}")
+            found = True
+        # 重复行直接丢掉
+    else:
+        out.append(line)
+if not found:
+    out.append(f"{key}={val}")
+with open(path, "w") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(path, 0o600)
+PY
+}
+
+mask_hash() {
+  local h="$1"
+  if [ -z "$h" ] || [ "$h" = "placeholder" ]; then
+    echo "未配置"
+  elif [ "${#h}" -le 8 ]; then
+    echo "****"
+  else
+    echo "${h:0:4}****${h: -4}"
+  fi
+}
+
+show_status() {
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "配置文件不存在：$ENV_FILE"
+    echo "api_id：未配置"
+    echo "api_hash：未配置"
+    return
+  fi
+  local id hash
+  id="$(get_val TG_API_ID)"
+  hash="$(get_val TG_API_HASH)"
+  if [ -z "$id" ] || [ "$id" = "0" ]; then
+    echo "api_id：未配置"
+  else
+    echo "api_id：$id"
+  fi
+  echo "api_hash：$(mask_hash "$hash")"
+  if [ -f "$APP_DIR/data/tg.session" ]; then
+    echo "登录 session：已存在（data/tg.session）"
+  else
+    echo "登录 session：不存在（还没在网页上登录过）"
+  fi
+}
+
+restart_service() {
+  if [ -n "$TG_NO_RESTART" ]; then
+    echo "（测试模式，跳过重启）"
+    return 0
+  fi
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    echo "找不到 $COMPOSE_FILE，改完配置后请手动重启服务。"
+    return 1
+  fi
+  (cd "$APP_DIR" && docker compose up -d) || {
+    echo "重启失败：请确认你是用 root 身份运行，并且 Docker 已安装。"
+    return 1
+  }
+  echo "服务已重启。"
+}
+
+do_set_id() {
+  local id="$1"
+  if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+    echo "api_id 必须是纯数字，例如 12345678。"
+    return 1
+  fi
+  set_val TG_API_ID "$id"
+  echo "api_id 已保存。"
+  restart_service
+}
+
+do_set_hash() {
+  local hash="$1"
+  if [ -z "$hash" ]; then
+    echo "api_hash 不能为空。"
+    return 1
+  fi
+  set_val TG_API_HASH "$hash"
+  echo "api_hash 已保存（终端里不回显完整值）。"
+  restart_service
+}
+
+show_web_password() {
+  local pw
+  pw="$(get_val WEB_PASSWORD)"
+  if [ -z "$pw" ]; then
+    echo "网页密码：未设置（任何人打开页面都不用密码，强烈建议用 tg reset-password 设一个）。"
+  else
+    echo "网页密码：$pw"
+    echo "注意：这个密码只在服务器终端里显示，不要发到聊天里、不要截图发给别人。"
+  fi
+}
+
+do_reset_web_password() {
+  local pw="$1"
+  if [ -z "$pw" ]; then
+    read -r -s -p "新网页密码（输入时不显示）： " pw
+    echo ""
+    read -r -s -p "再输一次确认： " pw2
+    echo ""
+    if [ -z "$pw" ]; then
+      echo "密码不能为空，已取消。"
+      return 1
+    fi
+    if [ "$pw" != "$pw2" ]; then
+      echo "两次输入不一致，已取消。"
+      return 1
+    fi
+  fi
+  set_val WEB_PASSWORD "$pw"
+  echo "网页密码已重置。"
+  echo "注意：旧的网页登录 Cookie 会失效，浏览器里要重新输新密码才能进。"
+  restart_service
+}
+
+do_del() {
+  set_val TG_API_ID "0"
+  set_val TG_API_HASH "placeholder"
+  echo "api 配置已删除（api_id 清空，api_hash 恢复为占位符）。"
+  echo "注意：网页上的登录 session 还在 data/tg.session 里，"
+  echo "如果换了另一套 api 凭证后登录异常，再把那个 session 文件删掉重新登录。"
+  restart_service
+}
+
+show_help() {
+  echo "tg - 视频库服务器快捷命令"
+  echo "  tg              交互菜单"
+  echo "  tg status       查看当前配置（hash 只显示掩码）"
+  echo "  tg set-id 12345 设置 api_id"
+  echo "  tg set-hash xxx 设置 api_hash"
+  echo "  tg del          删除 api 配置"
+  echo "  tg reset-password [新密码]  重置网页密码"
+  echo "  tg show-password  查看当前网页密码"
+  echo "  tg restart      重启服务"
+  echo "  tg help         帮助"
+}
+
+menu() {
+  while true; do
+    echo ""
+    echo "===== 视频库配置 ====="
+    show_status
+    echo ""
+    echo "1) 设置 api_id"
+    echo "2) 设置 api_hash"
+    echo "3) 删除 api 配置"
+    echo "4) 重置网页密码"
+    echo "5) 查看网页密码"
+    echo "6) 重启服务"
+    echo "0) 退出"
+    read -r -p "选一个 [0-6]： " choice
+    case "$choice" in
+      1)
+        read -r -p "api_id： " v
+        do_set_id "$v"
+        ;;
+      2)
+        read -r -s -p "api_hash（输入时不显示）： " v
+        echo ""
+        do_set_hash "$v"
+        ;;
+      3)
+        read -r -p "确认删除 api 配置吗？(y/N)： " confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+          do_del
+        else
+          echo "已取消。"
+        fi
+        ;;
+      4)
+        do_reset_web_password ""
+        ;;
+      5)
+        show_web_password
+        ;;
+      6)
+        restart_service
+        ;;
+      0|"")
+        echo "退出。"
+        break
+        ;;
+      *)
+        echo "没有这个选项，选 0-6。"
+        ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  status) show_status ;;
+  set-id) do_set_id "${2:-}" ;;
+  set-hash) do_set_hash "${2:-}" ;;
+  del) do_del ;;
+  reset-password|reset-pw) do_reset_web_password "${2:-}" ;;
+  show-password|view-password|show-pw|view-pw) show_web_password ;;
+  restart) restart_service ;;
+  help|-h|--help) show_help ;;
+  "") menu ;;
+  *) echo "未知命令：$1"; show_help; exit 1 ;;
+esac

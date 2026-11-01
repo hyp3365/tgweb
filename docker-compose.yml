@@ -1,0 +1,13 @@
+services:
+  tg-stream:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      TG_API_ID: "${TG_API_ID}"
+      TG_API_HASH: "${TG_API_HASH}"
+      TG_SESSION: "data/tg.session"
+      WEB_PASSWORD: "${WEB_PASSWORD:-}"

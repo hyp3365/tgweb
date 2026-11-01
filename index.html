@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>首页</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#000;color:#e8e8e8;margin:0;line-height:1.6}
+.wrap{max-width:1000px;margin:0 auto;padding:0 16px 40px}
+section{background:#0d0d0d;border:1px solid #222;border-radius:14px;padding:16px;margin:16px 0}
+h2{font-size:18px;margin:0 0 12px;font-weight:700}
+input,button{padding:10px 12px;font-size:15px;margin:4px 4px 4px 0;border-radius:8px}
+input{background:#111;color:#fff;border:1px solid #333}
+button{background:#fff;color:#000;border:1px solid #fff;cursor:pointer;font-weight:600}
+button:active{opacity:.85}
+video{width:100%;max-height:520px;background:#000;border-radius:12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.muted{color:#888;font-size:13px}
+.item{border-top:1px solid #222;padding:12px 0}
+.hidden{display:none !important}
+.topbar{position:sticky;top:0;z-index:10;background:#000;display:flex;justify-content:space-between;align-items:center;padding:1px 0;border-bottom:1px solid #222}
+.topbar button{padding:0 8px;font-size:12px;line-height:1.4;background:#1a1a1a;color:#ddd;border-color:#333}
+/* 搜索框压矮 */
+.search-section{padding:6px 10px;margin:10px 0}
+.search-row{flex-wrap:nowrap}
+.search-row input{flex:1 1 0;min-width:0;width:auto}
+.search-row button{flex-shrink:0}
+#q{height:24px;padding:4px 8px;font-size:13px}
+.search-row button{height:24px;padding:4px 12px;font-size:13px}
+#gate{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.login-box{width:100%;max-width:380px;background:#0a0a0a;border:1px solid #222;border-radius:16px;padding:32px 28px;text-align:center}
+.login-box p{margin:0 0 16px}
+.login-box input{width:100%;padding:12px;margin:12px 0}
+.login-box button{width:100%;padding:12px;margin-top:8px}
+#gateError{color:#ff6b6b;font-size:14px;min-height:20px;margin-top:8px}
+#accountPrompt{background:#111;border:1px solid #333;border-radius:12px;padding:12px 16px;margin:16px 0}
+.channels-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.channel-card{border:1px solid #222;border-radius:12px;padding:14px;cursor:pointer;background:#0d0d0d}
+.channel-card:hover{border-color:#555;background:#141414}
+.channel-row{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.channel-row .channel-info{min-width:0}
+.channel-row .channel-info b{font-size:15px}
+.channel-actions{display:flex;gap:6px;flex-shrink:0}
+.channel-actions button{padding:6px 12px;font-size:13px;margin:0}
+.chat-wrap{max-width:760px;margin:0 auto}
+.chat-msg{background:#111;border:1px solid #222;border-radius:12px;padding:10px 12px;margin:10px 0}
+.chat-msg .chat-meta{color:#888;font-size:12px;margin-bottom:4px}
+.chat-msg img{max-width:100%;border-radius:8px;display:block;margin-top:6px}
+.chat-thumb{position:relative;max-width:320px;aspect-ratio:16/9;background:#111;border-radius:8px;overflow:hidden;cursor:pointer;margin-top:6px}
+.chat-thumb img{width:100%;height:100%;object-fit:cover;margin:0}
+.chat-input-row{position:sticky;bottom:0;background:#000;padding:10px 0;display:flex;gap:8px}
+.search-item{cursor:pointer}
+.chat-link{color:#8ab4ff;text-decoration:underline;cursor:pointer}
+.chat-input-row input{flex:1;padding:10px 12px}
+.chat-input-row button{padding:10px 18px}
+.channel-card b{font-size:15px}
+.videos-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.video-card{border:1px solid #222;border-radius:12px;overflow:hidden;background:#0d0d0d}
+.video-card:hover{border-color:#444}
+.thumb{position:relative;aspect-ratio:16/9;background:#111;cursor:pointer;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb-placeholder{display:flex;align-items:center;justify-content:center;height:100%;color:#666;font-size:28px}
+.thumb .dur{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.75);padding:2px 6px;border-radius:6px;font-size:12px;color:#fff}
+.video-body{padding:12px}
+.video-title{font-size:14px;font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.5}
+.video-body button{margin-top:8px;padding:7px 14px;font-size:13px}
+.back-btn{padding:7px 12px;font-size:13px;background:#1a1a1a;color:#ddd;border-color:#333}
+.page-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}
+.sticky-header{position:sticky;top:22px;z-index:9;background:#000;display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #222;margin-bottom:12px}
+.sticky-header h2{margin:0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sticky-header button{flex-shrink:0;margin:0}
+.page-header h2{margin:0;flex:1;min-width:120px}
+.toggle-btn{padding:6px 12px;font-size:13px;margin:0}
+.toggle-btn.active{background:#fff;color:#000;border-color:#fff}
+.toggle-btn:not(.active){background:#1a1a1a;color:#ddd;border-color:#333}
+#chatLoadMoreBtn{height:28px;padding:4px 14px;font-size:13px;line-height:1.4}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
+.modal-box{width:100%;max-width:900px}
+.modal-box video{width:100%;max-height:80vh;background:#000;border-radius:12px}
+.modal-close{display:block;margin-left:auto;margin-bottom:10px;padding:7px 14px;font-size:14px}
+</style></head><body>
+
+<!-- 第一步：网页密码，全黑居中登录框 -->
+<div id="gate">
+  <div class="login-box">
+    <p class="muted">请输入网页密码进入</p>
+    <input id="webPw" type="password" placeholder="网页密码" autocomplete="current-password">
+    <button onclick="webLogin()">进入</button>
+    <div id="gateError"></div>
+  </div>
+</div>
+
+<!-- 通过网页密码后才显示 -->
+<div id="app" class="hidden">
+<div class="wrap">
+<div class="topbar">
+  <span id="status" class="muted" style="font-size:12px;line-height:1.4">正在检查登录状态…</span>
+  <button id="logoutBtn" class="hidden" onclick="logout()">退出账号</button>
+</div>
+
+<!-- 网页密码通过后，先进入这个检查页，再决定去登录页还是频道页 -->
+<div id="checkingView" class="hidden">
+  <section>
+  <h2>正在检查账号登录状态…</h2>
+  <p class="muted">网页密码已通过，正在确认账号有没有登录。</p>
+  </section>
+</div>
+
+<!-- 第二步：账号登录页（未登录账号时只显示这一页，并提示登录） -->
+<div id="loginView">
+  <div id="accountPrompt">
+    <b>请先登录账号</b><br>
+    <span class="muted">这一步是登录账号（手机号 + 手机 App 里的验证码），和刚才的网页密码不是同一个密码。登录后才能进入频道列表。</span>
+  </div>
+  <section>
+  <h2>登录账号</h2>
+  <p class="muted">注意：这里填的是账号登录，和刚才的网页密码不同。</p>
+  <div class="row">
+  <input id="phone" placeholder="手机号，带区号，如 +86138xxxxxxx" size="28">
+  <button onclick="sendCode()">获取验证码</button>
+  </div>
+  <div class="row">
+  <input id="code" placeholder="验证码（在手机 App 里收）" size="28">
+  <button onclick="submitCode()">提交验证码</button>
+  </div>
+  <div class="row">
+  <input id="twofa" type="password" placeholder="两步验证密码（没有就不用填）">
+  <button onclick="submitPassword()">提交两步验证密码</button>
+  </div>
+  </section>
+</div>
+
+<!-- 第三步：登录后进入的新页面：所有频道 -->
+<div id="channelsView" class="hidden">
+  <section class="search-section">
+  <div class="row search-row">
+  <input id="q" placeholder="名称、@用户名或链接" size="36">
+  <button onclick="doSearch()">搜索</button>
+  <button onclick="hideSearchResults()">隐藏结果</button>
+  </div>
+  <div id="searchResults"></div>
+  </section>
+  <h2>所有频道</h2>
+  <div id="channels" class="channels-grid muted">正在加载…</div>
+</div>
+
+<!-- 第四步：点击频道进入的新页面：该频道视频 -->
+<div id="channelView" class="hidden">
+  <div class="sticky-header">
+    <button class="back-btn" onclick="backToChannels()">← 返回所有频道</button>
+    <h2 id="channelTitle">频道</h2>
+    <button class="toggle-btn" onclick="switchToChat()">聊天</button>
+    <button class="toggle-btn active">视频</button>
+    <button id="joinBtnVideo" class="toggle-btn hidden" onclick="joinCurrentChannel()">加入</button>
+  </div>
+  <div id="videos" class="videos-grid muted">正在加载…</div>
+  <div id="loadMoreWrap" class="hidden" style="text-align:center;margin:16px 0">
+    <button id="loadMoreBtn" onclick="loadMoreVideos()">加载更多</button>
+    <span id="loadMoreStatus" class="muted"></span>
+  </div>
+</div>
+
+<!-- 聊天模式：正常聊天，文字/图片/视频都能看，底部可以输入文字发消息 -->
+<div id="chatView" class="hidden">
+  <div class="chat-wrap">
+  <div class="sticky-header">
+    <button class="back-btn" onclick="backToChannels()">← 返回所有频道</button>
+    <h2 id="chatTitle">聊天</h2>
+    <button class="toggle-btn active">聊天</button>
+    <button class="toggle-btn" onclick="switchToVideo()">视频</button>
+    <button id="joinBtnChat" class="toggle-btn hidden" onclick="joinCurrentChannel()">加入</button>
+  </div>
+  <div id="chatLoadMoreWrap" class="hidden" style="text-align:center;margin:10px 0">
+    <button id="chatLoadMoreBtn" onclick="loadOlderChat()">加载更早的消息</button>
+  </div>
+  <div id="chatMessages"></div>
+  <div class="chat-input-row">
+    <input id="chatInput" placeholder="输入消息…">
+    <button onclick="sendChatMessage()">发送</button>
+  </div>
+  </div>
+</div>
+
+</div>
+</div>
+
+<!-- 点击视频弹出的播放器：固定在屏幕中间，不滚动页面 -->
+<div id="playerModal" class="hidden modal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closePlayer()">× 关闭</button>
+    <video id="player" controls preload="metadata"></video>
+  </div>
+</div>
+
+<script>
+let currentChannelId = null;
+let currentChannelTitle = '';
+let currentChannelUsername = '';
+let joinedIds = new Set();
+function updateJoinButtons(){
+  const show = currentChannelId && !joinedIds.has(currentChannelId);
+  ['joinBtnVideo','joinBtnChat'].forEach(id=>{
+    const b = document.getElementById(id);
+    if (b) b.classList.toggle('hidden', !show);
+  });
+}
+async function joinCurrentChannel(){
+  if (!currentChannelId) return;
+  try{
+    const d = await api('/api/join',{method:'POST', body:JSON.stringify({channel: currentChannelUsername ? '@'+currentChannelUsername : String(currentChannelId)})});
+    if (d.joined?.id) joinedIds.add(d.joined.id);
+    joinedIds.add(currentChannelId);
+    updateJoinButtons();
+    alert('已加入，返回所有频道就能看到它');
+  }catch(e){ alert(e.message); }
+}
+let videoOffset = 0;
+let videoHasMore = false;
+let videoLoading = false;
+function showGate(){
+  document.getElementById('gate').classList.remove('hidden');
+  document.getElementById('app').classList.add('hidden');
+}
+function showApp(){
+  document.getElementById('gate').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+}
+function showView(name){
+  ['loginView','channelsView','channelView','checkingView','chatView'].forEach(id=>{
+    document.getElementById(id).classList.toggle('hidden', id !== name);
+  });
+}
+async function api(path, opts={}) {
+  const r = await fetch(path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
+  if (r.status === 401) {
+    const d = await r.json().catch(()=>({}));
+    if (d.detail === 'need_web_auth') { showGate(); throw new Error('需要先输入网页密码'); }
+    throw new Error(d.detail || '未登录账号');
+  }
+  const d = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(d.detail || ('请求失败 '+r.status));
+  return d;
+}
+function fmtSize(n){ if(n==null) return ''; const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i<3){n/=1024;i++;} return n.toFixed(1)+' '+u[i]; }
+function fmtDur(s){ if(s==null) return ''; return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/'/g,''); }
+function linkify(s){
+  // s 已经是 esc 过的文本：把 t.me/用户名 和 @用户名 变成可点链接，点开就是新频道/群组
+  let out = s.replace(/https?:\/\/t\.me\/([A-Za-z0-9_]+)/g, (m,u)=>`<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">${m}</a>`);
+  out = out.replace(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{4,})/g, (m,pre,u)=>`${pre}<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">@${u}</a>`);
+  return out;
+}
+async function openChannelLink(username){
+  try{
+    const d = await api('/api/resolve?username='+encodeURIComponent(username));
+    loadChat(d.id, d.title||username, d.username||username);
+  }catch(e){ alert(e.message); }
+}
+async function webLogin(){
+  const pw = document.getElementById('webPw').value;
+  const err = document.getElementById('gateError');
+  err.textContent = '';
+  try{
+    await api('/api/web-login',{method:'POST',body:JSON.stringify({password:pw})});
+    // 输入网页密码后先检查账号登录：没登录就停在登录页并提示登录
+    await refreshStatus();
+  }catch(e){
+    err.textContent = '密码不对，请重试';
+  }
+}
+document.getElementById('webPw').addEventListener('keydown', e=>{ if(e.key==='Enter') webLogin(); });
+async function refreshStatus(){
+  // 网页密码通过后，先进入检查页
+  showApp();
+  showView('checkingView');
+  try{
+    const s = await api('/api/status');
+    document.getElementById('logoutBtn').classList.toggle('hidden', !s.logged_in);
+    if (!s.configured) {
+      document.getElementById('status').textContent = '服务器还没配置凭证，请先在服务器上用 tg 命令配置';
+      showView('loginView');
+    } else if (!s.logged_in) {
+      document.getElementById('status').textContent = '未登录账号，请先登录';
+      showView('loginView');
+    } else {
+      document.getElementById('status').textContent = '已登录：'+(s.me?.name||'')+(s.me?.username?' @'+s.me.username:'');
+      // 登录后进入新页面：所有频道
+      showView('channelsView');
+      loadChannels();
+    }
+  }catch(e){
+    if (e.message !== '需要先输入网页密码') {
+      document.getElementById('status').textContent = e.message;
+      showView('loginView');
+    }
+  }
+}
+async function sendCode(){
+  try{
+    await api('/api/login',{method:'POST',body:JSON.stringify({phone:document.getElementById('phone').value})});
+    alert('验证码已发到你的手机 App');
+  }catch(e){ alert(e.message); }
+}
+async function submitCode(){
+  try{
+    const d = await api('/api/code',{method:'POST',body:JSON.stringify({code:document.getElementById('code').value})});
+    if(d.need_password){ alert('账号开了两步验证，请在下面填两步验证密码'); return; }
+    alert('登录成功'); await refreshStatus();
+  }catch(e){ alert(e.message); }
+}
+async function submitPassword(){
+  try{
+    await api('/api/password',{method:'POST',body:JSON.stringify({password:document.getElementById('twofa').value})});
+    alert('登录成功'); await refreshStatus();
+  }catch(e){ alert(e.message); }
+}
+async function logout(){ try{ await api('/api/logout',{method:'POST'}); }catch(e){} await refreshStatus(); }
+function hideSearchResults(){ document.getElementById('searchResults').innerHTML = ''; }
+async function doSearch(){
+  const raw = document.getElementById('q').value.trim(); if(!raw) return;
+  // t.me/jisou、https://t.me/jisou 一律当成 @jisou 去搜
+  let q = raw;
+  const tm = raw.match(/t\.me\/([A-Za-z0-9_]+)/);
+  if (tm && !raw.includes('/+') && !raw.includes('joinchat')) q = '@' + tm[1];
+  try{
+    const d = await api('/api/search?q='+encodeURIComponent(q));
+    document.getElementById('searchResults').innerHTML = d.results.length ? `<div style="text-align:right;margin-bottom:6px"><button onclick="hideSearchResults()" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + d.results.map(r=>
+      `<div class="item search-item" onclick="loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')"><b>${linkify(esc(r.title))}</b> ${r.username?`<a class="chat-link" onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">@${esc(r.username)}</a>`:''} <span class="muted">${esc(r.type)}</span><br>
+       <button onclick="event.stopPropagation();joinChannel('${r.username||r.id}')">加入</button>
+       <button onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">聊天</button>
+       <button onclick="event.stopPropagation();loadVideos(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">视频</button></div>`).join('')
+      : '<div class="muted">没搜到。私密订阅搜不到是正常的，用邀请链接直接加入。</div>';
+  }catch(e){ alert(e.message); await refreshStatus(); }
+}
+async function joinChannel(ch){
+  try{
+    const d = await api('/api/join',{method:'POST',body:JSON.stringify({channel:ch})});
+    alert('已加入：'+(d.joined?.title||ch));
+    if (d.joined?.id) { joinedIds.add(d.joined.id); loadChat(d.joined.id, d.joined.title||ch, d.joined.username||''); }
+    else loadChannels();
+  }catch(e){ alert(e.message); }
+}
+async function loadChannels(){
+  try{
+    const d = await api('/api/channels');
+    joinedIds = new Set(d.channels.map(c=>c.id));
+    document.getElementById('channels').innerHTML = d.channels.length ? d.channels.map(c=>
+      `<div class="channel-card" onclick="loadChat(${c.id},'${esc(c.title)}','${esc(c.username||'')}')"><b>${esc(c.title)}</b><br>
+       <span class="muted">${c.username?'@'+esc(c.username):''}</span></div>`).join('')
+      : '<div class="muted">还没有订阅，先搜索并添加一个。</div>';
+  }catch(e){ /* 未登录时 refreshStatus 已处理 */ }
+}
+function closePlayer(){
+  const p = document.getElementById('player');
+  p.pause(); p.removeAttribute('src'); p.load();
+  document.getElementById('playerModal').classList.add('hidden');
+  document.body.style.overflow = '';
+}
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePlayer(); });
+function backToChannels(){
+  closePlayer();
+  currentChannelId = null;
+  showView('channelsView');
+  loadChannels();
+}
+function switchToChat(){ if (currentChannelId) loadChat(currentChannelId, currentChannelTitle, currentChannelUsername); }
+function switchToVideo(){ if (currentChannelId) loadVideos(currentChannelId, currentChannelTitle, currentChannelUsername); }
+async function loadVideos(channelId, title, username=''){
+  currentChannelId = channelId;
+  currentChannelTitle = title || '';
+  currentChannelUsername = username || '';
+  updateJoinButtons();
+  hideSearchResults();
+  document.getElementById('channelTitle').textContent = title || '频道';
+  closePlayer();
+  videoOffset = 0; videoHasMore = false;
+  document.getElementById('videos').innerHTML = '正在加载…';
+  document.getElementById('loadMoreWrap').classList.add('hidden');
+  showView('channelView');
+  window.scrollTo({top:0,behavior:'smooth'});
+  await loadVideoPage(false);
+}
+function videoCards(videos, channelId){
+  return videos.map(v=>{
+    const title = linkify(esc(v.title || v.caption)) || ('视频 #' + v.msg_id);
+    const thumb = v.has_thumb
+      ? `<img src="/thumb/${channelId}/${v.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
+      : `<div class="thumb-placeholder">▶</div>`;
+    return `<div class="video-card">
+     <div class="thumb" onclick="playVideo(${channelId},${v.msg_id})">${thumb}<span class="dur">${fmtDur(v.duration)}</span></div>
+     <div class="video-body"><div class="video-title">${title}</div>
+     <span class="muted">${v.date?new Date(v.date).toLocaleString():''} · ${fmtSize(v.size)}</span><br>
+     <button onclick="playVideo(${channelId},${v.msg_id})">播放</button></div></div>`;
+  }).join('');
+}
+async function loadVideoPage(append){
+  if (videoLoading) return;
+  videoLoading = true;
+  const btn = document.getElementById('loadMoreBtn');
+  if (append) { btn.disabled = true; btn.textContent = '正在加载…'; }
+  try{
+    const d = await api(`/api/videos?channel_id=${currentChannelId}&limit=30&offset_id=${videoOffset}` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
+    const grid = document.getElementById('videos');
+    if (!append) {
+      grid.innerHTML = d.videos.length ? videoCards(d.videos, currentChannelId)
+        : '<div class="muted">这个频道最近没有视频（只列视频消息，图片/文字不列）。</div>';
+    } else if (d.videos.length) {
+      const oldCount = grid.children.length;
+      grid.insertAdjacentHTML('beforeend', videoCards(d.videos, currentChannelId));
+      const firstNew = grid.children[oldCount];
+      if (firstNew) firstNew.scrollIntoView({behavior:'smooth', block:'start'});
+    }
+    videoHasMore = !!d.has_more;
+    videoOffset = d.next_offset_id || videoOffset;
+    const wrap = document.getElementById('loadMoreWrap');
+    if (videoHasMore) {
+      wrap.classList.remove('hidden');
+      btn.disabled = false; btn.textContent = '加载更多';
+      document.getElementById('loadMoreStatus').textContent = '';
+    } else if (append) {
+      wrap.classList.remove('hidden');
+      btn.disabled = true; btn.textContent = '已经没有更多了';
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }catch(e){ alert(e.message); await refreshStatus(); }
+  videoLoading = false;
+}
+async function loadMoreVideos(){
+  await loadVideoPage(true);
+}
+
+let currentChatChannelId = null;
+let chatOldestId = 0;
+let chatHasMore = false;
+let chatLoading = false;
+function chatBubble(m, channelId){
+  let body = '';
+  if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
+  if (m.kind === 'photo') body += `<img src="/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="">`;
+  if (m.kind === 'video') {
+    const thumb = m.has_thumb
+      ? `<img src="/thumb/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
+      : `<div class="thumb-placeholder">▶</div>`;
+    body += `<div class="chat-thumb" onclick="playVideo(${channelId},${m.msg_id})">${thumb}<span class="dur">${fmtDur(m.duration)}</span></div><button onclick="playVideo(${channelId},${m.msg_id})" style="margin-top:6px;padding:6px 12px;font-size:13px">播放视频</button>`;
+  }
+  if (m.kind === 'document') body += `<div class="muted">[文件] ${esc(m.filename || '')} ${fmtSize(m.size)}</div>`;
+  if (!body) body = '<div class="muted">[这条消息没有文字]</div>';
+  return `<div class="chat-msg"><div class="chat-meta">${m.date?new Date(m.date).toLocaleString():''}</div>${body}</div>`;
+}
+async function loadChat(channelId, title, username=''){
+  currentChatChannelId = channelId;
+  currentChannelId = channelId;
+  currentChannelTitle = title || '';
+  currentChannelUsername = username || '';
+  updateJoinButtons();
+  hideSearchResults();
+  document.getElementById('chatTitle').textContent = title || '频道';
+  document.getElementById('chatMessages').innerHTML = '正在加载…';
+  document.getElementById('chatLoadMoreWrap').classList.add('hidden');
+  chatOldestId = 0; chatHasMore = false;
+  showView('chatView');
+  window.scrollTo({top:0,behavior:'smooth'});
+  await loadChatPage(false);
+}
+async function loadChatPage(appendOlder){
+  if (chatLoading) return;
+  chatLoading = true;
+  const btn = document.getElementById('chatLoadMoreBtn');
+  if (appendOlder) { btn.disabled = true; btn.textContent = '正在加载…'; }
+  try{
+    const d = await api(`/api/messages?channel_id=${currentChatChannelId}&limit=30&offset_id=${chatOldestId}` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
+    const box = document.getElementById('chatMessages');
+    const chronological = [...d.messages].reverse();
+    if (!appendOlder) {
+      box.innerHTML = d.messages.length ? chronological.map(m=>chatBubble(m, currentChatChannelId)).join('')
+        : '<div class="muted">这个频道还没有消息。</div>';
+      window.scrollTo({top:document.body.scrollHeight, behavior:'auto'});
+    } else if (d.messages.length) {
+      box.insertAdjacentHTML('afterbegin', chronological.map(m=>chatBubble(m, currentChatChannelId)).join(''));
+      window.scrollTo({top:0, behavior:'smooth'});
+    }
+    chatHasMore = !!d.has_more;
+    chatOldestId = d.next_offset_id || chatOldestId;
+    const wrap = document.getElementById('chatLoadMoreWrap');
+    if (chatHasMore) {
+      wrap.classList.remove('hidden');
+      btn.disabled = false; btn.textContent = '加载更早的消息';
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }catch(e){ alert(e.message); await refreshStatus(); }
+  chatLoading = false;
+}
+async function loadOlderChat(){ await loadChatPage(true); }
+async function sendChatMessage(){
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text) return;
+  try{
+    const d = await api('/api/send',{method:'POST', body:JSON.stringify({channel_id: currentChatChannelId, text, username: currentChannelUsername || null})});
+    const box = document.getElementById('chatMessages');
+    if (box.textContent.includes('还没有消息')) box.innerHTML = '';
+    box.insertAdjacentHTML('beforeend', chatBubble(d.message, currentChatChannelId));
+    input.value = '';
+    input.scrollIntoView({behavior:'smooth', block:'end'});
+  }catch(e){ alert(e.message); }
+}
+document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChatMessage(); });
+
+function playVideo(channelId, msgId){
+  // 只弹出播放器，不滚动页面、不移动列表位置
+  const p = document.getElementById('player');
+  document.getElementById('playerModal').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  p.src = `/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
+}
+refreshStatus();
+</script></body></html>
