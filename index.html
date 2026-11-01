@@ -254,11 +254,11 @@ async function api(path, opts={}) {
   return d;
 }
 function fmtSize(n){ if(n==null) return ''; const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i<3){n/=1024;i++;} return n.toFixed(1)+' '+u[i]; }
-function fmtDur(s){ if(s==null) return ''; return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
-function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/'/g,''); }
+function fmtDur(s){ if(s==null) return ''; s = Math.round(s); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function linkify(s){
   // s 已经是 esc 过的文本：把 t.me/用户名 和 @用户名 变成可点链接，点开就是新频道/群组
-  let out = s.replace(/https?:\/\/t\.me\/([A-Za-z0-9_]+)/g, (m,u)=>`<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">${m}</a>`);
+  let out = s.replace(/https?:\/\/t\.me\/(?!c\/|s\/|joinchat|\+)([A-Za-z0-9_]+)/g, (m,u)=>`<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">${m}</a>`);
   out = out.replace(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{4,})/g, (m,pre,u)=>`${pre}<a class="chat-link" onclick="event.stopPropagation();openChannelLink('${u}')">@${u}</a>`);
   return out;
 }
@@ -277,7 +277,7 @@ async function webLogin(){
     // 输入网页密码后先检查账号登录：没登录就停在登录页并提示登录
     await refreshStatus();
   }catch(e){
-    err.textContent = '密码不对，请重试';
+    err.textContent = e.message || '密码不对，请重试';
   }
 }
 document.getElementById('webPw').addEventListener('keydown', e=>{ if(e.key==='Enter') webLogin(); });
@@ -338,11 +338,11 @@ function renderSearchPage(){
   const page = searchResultsCache.slice(start, start + SEARCH_PAGE_SIZE);
   const hasNext = start + SEARCH_PAGE_SIZE < searchResultsCache.length;
   const hasPrev = searchPage > 0;
-  box.innerHTML = `<div style="text-align:right;margin-bottom:6px"><button onclick="hideSearchResults()" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + page.map(r=>
-    `<div class="item search-item" onclick="loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')"><b>${linkify(esc(r.title))}</b> ${r.username?`<a class="chat-link" onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">@${esc(r.username)}</a>`:''} <span class="muted">${esc(r.type)}</span><br>
-     <button onclick="event.stopPropagation();joinChannel('${r.username||r.id}')">加入</button>
-     <button onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">聊天</button>
-     <button onclick="event.stopPropagation();loadVideos(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">视频</button></div>`).join('')
+  box.innerHTML = `<div style="text-align:right;margin-bottom:6px"><button data-action="close" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + page.map(r=>
+    `<div class="item search-item" data-id="${r.id}" data-title="${esc(r.title)}" data-username="${esc(r.username||'')}"><b>${linkify(esc(r.title))}</b> ${r.username?`<span class="chat-link">@${esc(r.username)}</span>`:''} <span class="muted">${esc(r.type)}</span><br>
+     <button data-action="join" data-ch="${esc(r.username||r.id)}">加入</button>
+     <button data-action="chat">聊天</button>
+     <button data-action="video">视频</button></div>`).join('')
     + `<div style="text-align:center;margin:12px 0"><span class="muted">第 ${searchPage + 1} 页，共 ${searchResultsCache.length} 条</span><br>
     ${hasPrev ? `<button onclick="searchPage--;renderSearchPage()" style="margin-top:6px;padding:6px 12px;font-size:13px">上一页</button> ` : ''}
     ${hasNext ? `<button onclick="searchPage++;renderSearchPage()" style="margin-top:6px;padding:6px 12px;font-size:13px">下一页</button>` : (searchPage > 0 ? `<span class="muted" style="margin-left:8px">已经没有更多了</span>` : '')}</div>`;
@@ -372,7 +372,7 @@ async function loadChannels(){
     const d = await api('/api/channels');
     joinedIds = new Set(d.channels.map(c=>c.id));
     document.getElementById('channels').innerHTML = d.channels.length ? d.channels.map(c=>
-      `<div class="channel-card" onclick="loadChat(${c.id},'${esc(c.title)}','${esc(c.username||'')}')"><b>${esc(c.title)}</b><br>
+      `<div class="channel-card" data-id="${c.id}" data-title="${esc(c.title)}" data-username="${esc(c.username||'')}"><b>${esc(c.title)}</b><br>
        <span class="muted">${c.username?'@'+esc(c.username):''}</span></div>`).join('')
       : '<div class="muted">还没有订阅，先搜索并添加一个。</div>';
   }catch(e){ /* 未登录时 refreshStatus 已处理 */ }
@@ -474,9 +474,9 @@ function chatBubble(m, channelId){
   if (m.kind === 'document') body += `<div class="muted">[文件] ${esc(m.filename || '')} ${fmtSize(m.size)}</div>`;
   if (!body) body = '<div class="muted">[这条消息没有文字]</div>';
   if (m.buttons && m.buttons.length) {
-    kbCache[m.msg_id] = m.buttons;
+    kbCache[channelId + ":" + m.msg_id] = m.buttons;
     body += `<div class="inline-kb">` + m.buttons.map((row, ri) => `<div class="kb-row">` + row.map((b, ci) => {
-      if (b.type === 'url' && b.url) return `<a class="kb-btn" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.text)}</a>`;
+      if (b.type === 'url' && b.url && /^https?:\/\//.test(b.url)) return `<a class="kb-btn" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.text)}</a>`;
       return `<button class="kb-btn" onclick="clickInlineBtn(${channelId},${m.msg_id},${ri},${ci})">${esc(b.text)}</button>`;
     }).join('') + `</div>`).join('') + `</div>`;
   }
@@ -604,7 +604,7 @@ document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==
 
 let kbCache = {};
 async function clickInlineBtn(channelId, msgId, row, col){
-  const btn = (kbCache[msgId] || [])[row] ? kbCache[msgId][row][col] : null;
+  const btn = (kbCache[channelId + ':' + msgId] || [])[row] ? kbCache[channelId + ':' + msgId][row][col] : null;
   if (!btn) return;
   if (btn.type === 'switch' && btn.query) {
     const inp = document.getElementById('chatSearchInput');
@@ -633,5 +633,25 @@ function playVideo(channelId, msgId){
   document.body.style.overflow = 'hidden';
   p.src = `/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
 }
+document.getElementById('searchResults').addEventListener('click', e=>{
+  const btn = e.target.closest('button');
+  if (btn && btn.dataset.action === 'close') { hideSearchResults(); return; }
+  const item = e.target.closest('.search-item');
+  if (!item) return;
+  const id = Number(item.dataset.id);
+  const title = item.dataset.title || '';
+  const username = item.dataset.username || '';
+  if (btn) {
+    if (btn.dataset.action === 'join') { joinChannel(btn.dataset.ch); return; }
+    if (btn.dataset.action === 'chat') { loadChat(id, title, username); return; }
+    if (btn.dataset.action === 'video') { loadVideos(id, title, username); return; }
+  }
+  loadChat(id, title, username);
+});
+document.getElementById('channels').addEventListener('click', e=>{
+  const card = e.target.closest('.channel-card');
+  if (!card) return;
+  loadChat(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '');
+});
 refreshStatus();
 </script></body></html>

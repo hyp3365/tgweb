@@ -33,7 +33,7 @@ elif [ -d "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
   mv "$DIR" "$BACKUP"
   git clone "$REPO" "$DIR"
   [ -f "$BACKUP/.env" ] && cp "$BACKUP/.env" "$DIR/.env"
-  [ -d "$BACKUP/data" ] && cp -r "$BACKUP/data" "$DIR/data" 2>/dev/null || true
+  [ -d "$BACKUP/data" ] && mkdir -p "$DIR/data" && cp -r "$BACKUP/data/." "$DIR/data/" 2>/dev/null || true
   echo "旧目录已备份到 $BACKUP"
 else
   git clone "$REPO" "$DIR"
@@ -71,6 +71,10 @@ if [ ! -f "$DIR/.env" ]; then
   if [ -z "$WEB_PW" ]; then
     WEB_PW="$(openssl rand -hex 8)"
     NEW_PW="$WEB_PW"
+  elif python3 -c 'import sys; pw=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in pw for c in bad) or any(c.isspace() for c in pw) else 1)' "$WEB_PW"; then
+    echo "提供的网页密码含美元符、井号、引号、空格或反斜杠，.env 会被 docker compose 认错，已改成自动生成的安全密码。"
+    WEB_PW="$(openssl rand -hex 8)"
+    NEW_PW="$WEB_PW"
   fi
   printf 'TG_API_ID=%s\nTG_API_HASH=%s\nWEB_PASSWORD=%s\n' "$API_ID" "$API_HASH" "$WEB_PW" > "$DIR/.env"
   chmod 600 "$DIR/.env"
@@ -86,13 +90,55 @@ if curl -fsS http://127.0.0.1:8000/ >/dev/null 2>&1; then
 else
   echo "服务启动检查失败，请在 $DIR 里看 docker compose logs。"
 fi
+# 8000 只绑回环，不直接对公网开放；80 口走 nginx 反代，tg domain 绑域名后 HTTPS 才不会被 8000 直连绕过
+NGINX_OK=0
+if grep -rq "proxy_pass http://127.0.0.1:8000" /etc/nginx/ 2>/dev/null; then
+  echo "检测到已有 Nginx 反代到 8000，跳过 Nginx 配置。"
+  NGINX_OK=1
+else
+  if ! command -v nginx >/dev/null 2>&1; then
+    apt-get install -y nginx 2>/dev/null || true
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    cat > /etc/nginx/conf.d/tgweb.conf <<'NGINXEOF'
+server {
+    listen 80;
+    server_name _;
+    server_tokens off;
+    client_max_body_size 0;
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+NGINXEOF
+    if nginx -t 2>/dev/null; then
+      systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null || true
+      NGINX_OK=1
+    else
+      rm -f /etc/nginx/conf.d/tgweb.conf
+      echo "Nginx 配置检查失败，已跳过反代，服务只能从本机 127.0.0.1:8000 访问。"
+    fi
+  fi
+fi
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -z "$IP" ] && IP="服务器IP"
 echo ""
-echo "访问地址：http://$IP:8000"
+if [ "$NGINX_OK" = "1" ]; then
+  echo "访问地址：http://$IP/"
+else
+  echo "访问地址：http://127.0.0.1:8000（仅本机，请自行配反代）"
+fi
 if [ -n "$NEW_PW" ]; then
   echo "网页密码（刚生成的，请记下来）：$NEW_PW"
 else
   echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
 fi
-echo "如需只走 https，请自行用 nginx 反代 127.0.0.1:8000，并把 docker-compose.yml 端口改回 127.0.0.1:8000:8000。"
+echo "如需 HTTPS，用 tg domain 绑定域名。"

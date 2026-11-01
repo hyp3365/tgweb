@@ -4,9 +4,11 @@ Telegram 频道视频小网页：登录 / 搜索 / 加频道 / 流式播放
 视频不先落盘：/stream 按浏览器的 Range 请求，从 Telegram 按需取片段转发。
 只给自己用：不要把 8000 端口公开给全网，见 README 的安全一节。
 """
-import hashlib
+import asyncio
 import os
 import re
+import secrets
+import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -22,7 +24,11 @@ API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_PATH = os.environ.get("TG_SESSION", "data/tg.session")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
-WEB_TOKEN = hashlib.sha256(WEB_PASSWORD.encode()).hexdigest() if WEB_PASSWORD else ""
+WEB_SESSION_DAYS = 30
+_web_sessions: dict = {}  # token -> expiry timestamp，cookie 本身不再是密码的哈希，泄露也推不出密码
+_web_attempts: dict = {}  # ip -> [失败时间戳]，10 分钟内 5 次失败就限流 10 分钟
+_client_lock = asyncio.Lock()
+_entity_lock = asyncio.Lock()
 
 app = FastAPI(title="app", docs_url=None, redoc_url=None, openapi_url=None)
 _client: TelegramClient | None = None
@@ -30,7 +36,13 @@ _login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}
 
 
 def check_web_auth(request: Request):
-    if WEB_PASSWORD and request.cookies.get("web_token") != WEB_TOKEN:
+    if not WEB_PASSWORD:
+        raise HTTPException(status_code=401, detail="need_web_auth")
+    token = request.cookies.get("web_token")
+    exp = _web_sessions.get(token) if token else None
+    if exp is None or exp < time.time():
+        if token:
+            _web_sessions.pop(token, None)
         raise HTTPException(status_code=401, detail="need_web_auth")
 
 
@@ -38,11 +50,49 @@ async def get_client() -> TelegramClient:
     global _client
     if not API_ID or not API_HASH:
         raise HTTPException(status_code=500, detail="服务器未配置凭证")
-    if _client is None:
-        _client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-    if not _client.is_connected():
-        await _client.connect()
-    return _client
+    async with _client_lock:
+        if _client is None:
+            _client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+        if not _client.is_connected():
+            await _client.connect()
+        return _client
+
+
+@app.on_event("shutdown")
+async def _shutdown_client():
+    global _client
+    if _client is not None and _client.is_connected():
+        try:
+            await _client.disconnect()
+        except Exception:
+            pass
+
+
+def _tg_error(e):
+    # 把 Telethon 抛出的错误翻译成用户能看懂的 400/429，不再直接 500
+    name = type(e).__name__
+    msg = str(e)
+    up = msg.upper()
+    if "FLOOD" in name.upper() or "FLOOD" in up:
+        import re as _re
+        m = _re.search(r"(\d+)", msg)
+        sec = m.group(1) if m else "?"
+        return 429, f"请求太频繁，请 {sec} 秒后再试"
+    if "PHONE_CODE_INVALID" in up or "CODE_INVALID" in up:
+        return 400, "验证码不对，请重新输入"
+    if "PHONE_CODE_EXPIRED" in up or "CODE_EXPIRED" in up:
+        return 400, "验证码已过期，请重新获取"
+    if "PASSWORD_HASH_INVALID" in up or "PASSWORD_INVALID" in up:
+        return 400, "两步验证密码不对"
+    if "PHONE_NUMBER_INVALID" in up or "PHONE_INVALID" in up:
+        return 400, "手机号格式不对，请带区号，如 +86138xxxxxxx"
+    if "INVITE_HASH_EXPIRED" in up or "INVITE_EXPIRED" in up:
+        return 400, "邀请链接已过期"
+    if "INVITE_HASH_INVALID" in up or "INVITE_INVALID" in up:
+        return 400, "邀请链接无效"
+    if "USER_ALREADY_PARTICIPANT" in up or "ALREADY_PARTICIPANT" in up:
+        return 400, "已经在群组里了"
+    return 400, f"请求失败：{msg[:200]}" if msg else "请求失败"
 
 
 async def require_login() -> TelegramClient:
@@ -58,11 +108,25 @@ class WebLoginIn(BaseModel):
 
 
 @app.post("/api/web-login")
-async def web_login(body: WebLoginIn):
-    if not WEB_PASSWORD or body.password != WEB_PASSWORD:
+async def web_login(request: Request, body: WebLoginIn):
+    if not WEB_PASSWORD:
+        raise HTTPException(status_code=401, detail="网页密码未设置，请在服务器上用 tg reset-password 设置一个")
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    now = time.time()
+    attempts = [ts for ts in _web_attempts.get(ip, []) if now - ts < 600]
+    _web_attempts[ip] = attempts
+    if len(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="尝试太多次，请 10 分钟后再试")
+    if not secrets.compare_digest(body.password or "", WEB_PASSWORD):
+        attempts.append(now)
+        _web_attempts[ip] = attempts
         raise HTTPException(status_code=401, detail="网页密码不对")
+    _web_attempts.pop(ip, None)
+    token = secrets.token_urlsafe(32)
+    _web_sessions[token] = now + WEB_SESSION_DAYS * 24 * 3600
     resp = JSONResponse({"ok": True})
-    resp.set_cookie("web_token", WEB_TOKEN, httponly=True, samesite="lax", path="/")
+    secure = request.headers.get("x-forwarded-proto", "") == "https" or request.url.scheme == "https"
+    resp.set_cookie("web_token", token, httponly=True, samesite="lax", path="/", secure=secure, max_age=WEB_SESSION_DAYS * 24 * 3600)
     return resp
 
 
@@ -101,7 +165,11 @@ async def status(request: Request):
 async def login_phone(request: Request, body: PhoneIn):
     check_web_auth(request)
     client = await get_client()
-    sent = await client.send_code_request(body.phone.strip())
+    try:
+        sent = await client.send_code_request(body.phone.strip())
+    except Exception as e:
+        code, detail = _tg_error(e)
+        raise HTTPException(status_code=code, detail=detail)
     _login_state["phone"] = body.phone.strip()
     _login_state["phone_code_hash"] = sent.phone_code_hash
     return {"ok": True, "need_code": True}
@@ -119,6 +187,9 @@ async def login_code(request: Request, body: CodeIn):
                              phone_code_hash=_login_state.get("phone_code_hash"))
     except SessionPasswordNeededError:
         return {"ok": False, "need_password": True}
+    except Exception as e:
+        code, detail = _tg_error(e)
+        raise HTTPException(status_code=code, detail=detail)
     return {"ok": True, "logged_in": True}
 
 
@@ -126,7 +197,11 @@ async def login_code(request: Request, body: CodeIn):
 async def login_password(request: Request, body: PasswordIn):
     check_web_auth(request)
     client = await get_client()
-    await client.sign_in(password=body.password)
+    try:
+        await client.sign_in(password=body.password)
+    except Exception as e:
+        code, detail = _tg_error(e)
+        raise HTTPException(status_code=code, detail=detail)
     return {"ok": True, "logged_in": True}
 
 
@@ -248,25 +323,41 @@ async def join(request: Request, body: JoinIn):
     # 私密邀请链接
     m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", s)
     if m:
-        res = await client(ImportChatInviteRequest(m.group(1)))
+        try:
+            res = await client(ImportChatInviteRequest(m.group(1)))
+        except Exception as e:
+            code, detail = _tg_error(e)
+            raise HTTPException(status_code=code, detail=detail)
         entity = res.chats[0] if res.chats else None
         _mark_recently_joined(entity)
         return {"ok": True, "joined": _chat_info(entity) if entity else None}
     # 数字 id：先在已加入对话里找，找不到再当 PeerChannel 解析（失败给 400 明示，不抛 500）
     entity = None
     if re.fullmatch(r"-?\d+", s):
-        cid = abs(int(s))
-        if cid in _entity_cache:
-            entity = _entity_cache[cid]
-        else:
+        # Bot API 格式 -1001234567：Telethon 的频道 id 是去掉 -100 前缀的 1234567，不是 abs() 的 1001234567
+        cands = []
+        if s.startswith("-100"):
+            cands.append(int(s[4:]))
+        cands.append(abs(int(s)))
+        for cid in cands:
+            if cid in _entity_cache:
+                entity = _entity_cache[cid]
+                break
             async for dialog in client.iter_dialogs(limit=1000):
                 if dialog.entity.id == cid:
                     entity = dialog.entity
+                    _cache_entity(entity)
                     break
+            if entity is not None:
+                break
         if entity is None:
-            try:
-                entity = await client.get_entity(PeerChannel(cid))
-            except Exception:
+            for cid in cands:
+                try:
+                    entity = await client.get_entity(PeerChannel(cid))
+                    break
+                except Exception:
+                    continue
+            if entity is None:
                 raise HTTPException(status_code=400, detail="找不到这个频道，请重新搜索一次再点加入")
     else:
         # jisou / t.me/jisou / @jisou 一律归一化成 @jisou 再解析
@@ -309,6 +400,7 @@ async def my_channels(request: Request):
     seen = set()
     async for dialog in client.iter_dialogs(limit=1000):
         e = dialog.entity
+        _cache_entity(e)
         if isinstance(e, (Channel, Chat)) and e.id not in seen:
             seen.add(e.id)
             out.append(_chat_info(e))
@@ -329,6 +421,8 @@ def _normalize_username(s):
         return None  # 邀请码不是用户名，走邀请流程
     m = re.search(r"t\.me/(?:@)?([A-Za-z0-9_]+)", s)
     if m:
+        if m.group(1) in ("c", "s"):
+            return None  # t.me/c/123/45 是私密频道消息链接，t.me/s/xxx 是公开预览，都不是用户名
         return "@" + m.group(1)
     if s.startswith("@"):
         return s
@@ -339,17 +433,25 @@ def _normalize_username(s):
 
 # ---------- 视频列表 ----------
 async def _channel_entity(client, channel_id: int, username=None):
-    async for dialog in client.iter_dialogs(limit=1000):
-        if dialog.entity.id == channel_id:
-            return dialog.entity
-    # 关键修复：没加入的频道不能只靠 PeerChannel(id) 解析，Telethon 需要 access_hash，
-    # 没见过的频道会报 Could not find the input entity（就是日志里的 500）。
-    # 顺序：搜索缓存 > 用户名解析 > PeerChannel，失败给 404 明示，不再抛 500。
+    # Bot API 格式的负 id 先归一化成 Telethon 的正 id
+    if isinstance(channel_id, int) and channel_id < 0 and str(channel_id).startswith("-100"):
+        channel_id = int(str(channel_id)[4:])
+    # 先查缓存：缩略图/视频/流式播放每次都先遍历 1000 个对话会慢还容易 FloodWait
+    if channel_id in _entity_cache:
+        return _entity_cache[channel_id]
     uname = _normalize_username(username) if username else None
     if uname and uname[1:].lower() in _entity_cache_by_username:
         return _entity_cache_by_username[uname[1:].lower()]
-    if channel_id in _entity_cache:
-        return _entity_cache[channel_id]
+    async with _entity_lock:
+        # 锁里再查一次：30 张缩略图并发时，第一个遍历完缓存后，后面的直接命中，不再重复遍历
+        if channel_id in _entity_cache:
+            return _entity_cache[channel_id]
+        if uname and uname[1:].lower() in _entity_cache_by_username:
+            return _entity_cache_by_username[uname[1:].lower()]
+        async for dialog in client.iter_dialogs(limit=1000):
+            _cache_entity(dialog.entity)
+            if dialog.entity.id == channel_id:
+                return dialog.entity
     if uname:
         try:
             entity = await client.get_entity(uname)
@@ -665,16 +767,26 @@ async def photo(request: Request, channel_id: int, msg_id: int, username: str | 
 
 # ---------- 流式播放：按 Range 从 Telegram 取片段，不落盘 ----------
 def _parse_range(range_header: str | None, total: int):
+    # 返回 (start, end)，非法返回 None，调用方回 416；不要在这里抛 int() 的 ValueError 变成 500
     if not range_header or not range_header.startswith("bytes="):
         return 0, total - 1
     spec = range_header[6:].split(",")[0].strip()
-    if spec.startswith("-"):
-        start = max(0, total - int(spec[1:]))
-        return start, total - 1
-    parts = spec.split("-")
-    start = int(parts[0]) if parts[0] else 0
-    end = int(parts[1]) if len(parts) > 1 and parts[1] else total - 1
-    return max(0, start), min(total - 1, end)
+    try:
+        if spec.startswith("-"):
+            n = int(spec[1:])
+            if n <= 0:
+                return None
+            return max(0, total - n), total - 1
+        parts = spec.split("-")
+        if len(parts) != 2:
+            return None
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else total - 1
+    except ValueError:
+        return None
+    if start < 0 or end < start or start >= total:
+        return None
+    return start, min(total - 1, end)
 
 
 @app.get("/stream/{channel_id}/{msg_id}")
@@ -691,12 +803,22 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
         raise HTTPException(status_code=404, detail="这条消息没有视频")
     total = doc.size
     mime = doc.mime_type or "video/mp4"
-    start, end = _parse_range(request.headers.get("range"), total)
+    parsed = _parse_range(request.headers.get("range"), total)
+    if parsed is None:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    start, end = parsed
     length = end - start + 1
 
     async def gen():
-        # offset/limit 已在上面实测签名里确认：iter_download(file, offset=, limit=)
-        async for chunk in client.iter_download(media, offset=start, limit=length, file_size=total):
+        # Telethon 的 limit 是分块数，不是字节数，传 limit=length 会一直下到文件末尾，
+        # 发出的数据比 Content-Length 多，uvicorn 会断开；Safari 发 bytes=0-1 探测时尤其明显。
+        # 这里不传 limit，按字节截断，剩 0 就停。
+        remaining = length
+        async for chunk in client.iter_download(media, offset=start, file_size=total):
+            if remaining <= 0:
+                break
+            chunk = chunk[:remaining]
+            remaining -= len(chunk)
             yield chunk
 
     headers = {"Accept-Ranges": "bytes", "Content-Length": str(length),

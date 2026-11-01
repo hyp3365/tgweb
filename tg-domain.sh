@@ -12,6 +12,10 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 [ "$(id -u)" = 0 ] || exec sudo bash "$0" "$@"
+if ! command -v nginx >/dev/null 2>&1; then
+  echo "Nginx 未安装，请先装 Nginx 再用 tg domain。"
+  exit 1
+fi
 
 CONF=/etc/nginx/conf.d/tgweb-domain.conf
 OLD_PREFIX=/etc/nginx/conf.d/tgweb-domain-   # 旧版每个域名一份，换成单份时清掉
@@ -85,6 +89,9 @@ check_and_issue_ssl() {
     # 指定域名
     domain=$(echo "$input_domain" | tr -d '[:space:]')
     if [[ -z "$domain" ]]; then red "域名不能为空！"; return 1; fi
+    if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then red "IP 不用走域名工具，直接用 IP 访问。"; return 1; fi
+    local domain_re='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+    if ! [[ "$domain" =~ $domain_re ]]; then red "域名格式不对，例如 example.com"; return 1; fi
 
     # 1. 该域名自己的证书
     local existing_path=""
