@@ -5,6 +5,7 @@ Telegram 频道视频小网页：登录 / 搜索 / 加频道 / 流式播放
 只给自己用：不要把 8000 端口公开给全网，见 README 的安全一节。
 """
 import asyncio
+import ipaddress
 import os
 import re
 import secrets
@@ -64,12 +65,27 @@ def _chmod_session():
 
 
 def _client_ip(request):
-    # 只信任回环代理（nginx 在本机）带来的 X-Real-IP：nginx 是用 $remote_addr 覆盖写这个头的，伪造不了；
-    # X-Forwarded-For 是追加的，第一个值就是攻击者自己填的，绝不能当 IP 用。
-    # 非回环直连时一律用真实连接 IP，不认任何头。
+    # nginx 是用 $remote_addr 覆盖写 X-Real-IP 的，伪造不了；X-Forwarded-For 是追加的，第一个值就是攻击者填的，绝不能当 IP 用。
+    # 上一版只认 127.0.0.1/::1 是错的：程序跑在 Docker 里，nginx 连进来时容器里看到的来源是 Docker 网关 IP（如 172.18.0.1），不是回环，
+    # 结果所有人都共用网关 IP 一个限流名额，别人输错 5 次就能把所有人锁在门外。
+    # 修法：连接来源不是公网 IP 时才认 X-Real-IP——回环、私网（含 Docker 网关）、链路本地都算非公网，远程公网直连则不认任何头。
+    # 这么认是安全的，因为应用端口只绑了宿主回环，远程攻击者到不了容器端口，只能走 nginx，而 nginx 会覆盖写 X-Real-IP。
     host = request.client.host if request.client else None
-    if host in ("127.0.0.1", "::1"):
-        return request.headers.get("x-real-ip", "").strip() or host
+    real = request.headers.get("x-real-ip", "").strip()
+    # 只认明确的代理来源，不用 is_global/is_private：Python 里文档段 203.0.113.x、198.51.100.x 的 is_global 也是 False，is_private 也是 True，
+    # 靠这两个判断会把文档 IP 也当成可信代理。白名单只列回环、私网（含 Docker 网关 172.17/172.18）、链路本地、IPv6 本地。
+    _trusted = [ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"), ipaddress.ip_network("192.168.0.0/16"),
+                ipaddress.ip_network("169.254.0.0/16"), ipaddress.ip_network("::1/128"),
+                ipaddress.ip_network("fe80::/10"), ipaddress.ip_network("fd00::/8")]
+    if real and host:
+        try:
+            ipaddress.ip_address(real)
+            host_ip = ipaddress.ip_address(host)
+            if any(host_ip in net for net in _trusted):
+                return real
+        except ValueError:
+            pass
     return host or "unknown"
 _client: TelegramClient | None = None
 _login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}
