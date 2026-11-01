@@ -14,6 +14,8 @@ tg set-hash xxx
 tg del
 tg reset-password [新密码]
 tg show-password
+tg reset-path
+tg show-path
 tg domain [域名]
 tg uninstall
 tg restart

@@ -77,10 +77,19 @@ if [ ! -f "$DIR/.env" ]; then
     WEB_PW="$(openssl rand -hex 8)"
     NEW_PW="$WEB_PW"
   fi
-  printf 'TG_API_ID=%s\nTG_API_HASH=%s\nWEB_PASSWORD=%s\n' "$API_ID" "$API_HASH" "$WEB_PW" > "$DIR/.env"
+  WEB_PATH="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+  if [ "${#WEB_PATH}" != "24" ]; then WEB_PATH="$(openssl rand -hex 12)"; fi
+  printf 'TG_API_ID=%s\nTG_API_HASH=%s\nWEB_PASSWORD=%s\nWEB_PATH=%s\n' "$API_ID" "$API_HASH" "$WEB_PW" "$WEB_PATH" > "$DIR/.env"
   chmod 600 "$DIR/.env"
 else
   echo "已有 .env，保留不动，改配置用 tg 命令。"
+  if ! grep -q "^WEB_PATH=" "$DIR/.env" 2>/dev/null; then
+    _NP="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+    if [ "${#_NP}" = "24" ]; then
+      printf 'WEB_PATH=%s\n' "$_NP" >> "$DIR/.env"
+      echo "已有 .env 里没有访问路径，已自动生成一个24位路径，完整地址见绑定后的提示，或用 tg show-path 查看。"
+    fi
+  fi
 fi
 
 (cd "$DIR" && docker compose up -d --build)
@@ -120,7 +129,7 @@ BIND_NAME="$(echo "$BIND_NAME" | tr -d '[:space:]')"
 if [ -z "$BIND_NAME" ]; then
   echo ""
   echo "未绑定域名或 IP 证书，外部访问未开通：服务只在 127.0.0.1:8000 运行，不提供 HTTP 访问。"
-  echo "请把证书放到 /root/cert/<域名或IP>/fullchain.pem 和 privkey.pem，然后运行 tg domain <域名或IP> 绑定，再用 https://<域名或IP> 访问。"
+  echo "请把证书放到 /root/cert/<域名或IP>/fullchain.pem 和 privkey.pem，然后运行 tg domain <域名或IP> 绑定，再用 https://<域名或IP>/<访问路径> 访问（路径用 tg show-path 查看）。"
   if [ -d /root/cert ] || [ -d /etc/nginx/cert ]; then
     echo "本机已有证书："
     for d in /root/cert/* /etc/nginx/cert/*; do
@@ -141,7 +150,7 @@ elif [ -f "/etc/nginx/cert/$BIND_NAME/fullchain.pem" ] && [ -f "/etc/nginx/cert/
 else
   echo ""
   echo "域名/IP $BIND_NAME 的证书不存在：/root/cert/$BIND_NAME/ 或 /etc/nginx/cert/$BIND_NAME/ 里要有 fullchain.pem 和 privkey.pem。"
-  echo "安装不会提供 HTTP 访问。请准备好证书后运行 tg domain $BIND_NAME 绑定（tg domain 还能用泛域名/父域名证书），再用 https://$BIND_NAME 访问。"
+  echo "安装不会提供 HTTP 访问。请准备好证书后运行 tg domain $BIND_NAME 绑定（tg domain 还能用泛域名/父域名证书），再用 https://$BIND_NAME/<访问路径> 访问（路径用 tg show-path 查看）。"
   if [ -n "$NEW_PW" ]; then
     echo "网页密码（刚生成的，请记下来）：$NEW_PW"
   else
@@ -151,7 +160,12 @@ else
 fi
 if /usr/local/bin/tg-domain "$BIND_NAME"; then
   echo ""
-  echo "访问地址：https://$BIND_NAME"
+  _WP="$(grep -E "^WEB_PATH=" "$DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"
+  if [ -n "$_WP" ]; then
+    echo "访问地址：https://$BIND_NAME/$_WP"
+  else
+    echo "访问地址：https://$BIND_NAME"
+  fi
   if [ -n "$NEW_PW" ]; then
     echo "网页密码（刚生成的，请记下来）：$NEW_PW"
   else

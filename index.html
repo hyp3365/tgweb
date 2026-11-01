@@ -242,8 +242,9 @@ function showView(name){
     document.getElementById(id).classList.toggle('hidden', id !== name);
   });
 }
+const WEB_BASE = (()=>{ const seg = window.location.pathname.split('/').filter(Boolean)[0]; return seg ? '/' + seg : ''; })();
 async function api(path, opts={}) {
-  const r = await fetch(path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
+  const r = await fetch(WEB_BASE + path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
   if (r.status === 401) {
     const d = await r.json().catch(()=>({}));
     if (d.detail === 'need_web_auth') { showGate(); throw new Error('需要先输入网页密码'); }
@@ -412,7 +413,7 @@ function videoCards(videos, channelId){
   return videos.map(v=>{
     const title = linkify(esc(v.title || v.caption)) || ('视频 #' + v.msg_id);
     const thumb = v.has_thumb
-      ? `<img src="/thumb/${channelId}/${v.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
+      ? `<img src="${WEB_BASE}/thumb/${channelId}/${v.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
       : `<div class="thumb-placeholder">▶</div>`;
     return `<div class="video-card">
      <div class="thumb" onclick="playVideo(${channelId},${v.msg_id})">${thumb}<span class="dur">${fmtDur(v.duration)}</span></div>
@@ -465,10 +466,10 @@ let chatLoading = false;
 function chatBubble(m, channelId){
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
-  if (m.kind === 'photo') body += `<img src="/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="">`;
+  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="">`;
   if (m.kind === 'video') {
     const thumb = m.has_thumb
-      ? `<img src="/thumb/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
+      ? `<img src="${WEB_BASE}/thumb/${channelId}/${m.msg_id}${currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
       : `<div class="thumb-placeholder">▶</div>`;
     body += `<div class="chat-thumb" onclick="playVideo(${channelId},${m.msg_id})">${thumb}<span class="dur">${fmtDur(m.duration)}</span></div><button onclick="playVideo(${channelId},${m.msg_id})" style="margin-top:6px;padding:6px 12px;font-size:13px">播放视频</button>`;
   }
@@ -632,7 +633,7 @@ function playVideo(channelId, msgId){
   const p = document.getElementById('player');
   document.getElementById('playerModal').classList.remove('hidden');
   document.body.style.overflow = 'hidden';
-  p.src = `/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
+  p.src = `${WEB_BASE}/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
 }
 document.getElementById('searchResults').addEventListener('click', e=>{
   const btn = e.target.closest('button');

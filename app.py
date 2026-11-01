@@ -24,6 +24,7 @@ API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_PATH = os.environ.get("TG_SESSION", "data/tg.session")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+WEB_PATH = os.environ.get("WEB_PATH", "").strip().strip("/")
 WEB_SESSION_DAYS = 30
 _web_sessions: dict = {}  # token -> expiry timestamp，cookie 本身不再是密码的哈希，泄露也推不出密码
 _web_attempts: dict = {}  # ip -> [失败时间戳]，10 分钟内 5 次失败就限流 10 分钟
@@ -35,6 +36,15 @@ app = FastAPI(title="app", docs_url=None, redoc_url=None, openapi_url=None)
 
 @app.middleware("http")
 async def _security_headers(request, call_next):
+    if WEB_PATH:
+        raw = request.scope.get("path", "")
+        prefix = "/" + WEB_PATH
+        if raw == prefix or raw.startswith(prefix + "/"):
+            rest = raw[len(prefix):] or "/"
+            request.scope["path"] = rest
+            request.scope["raw_path"] = rest.encode()
+        else:
+            return Response(status_code=404, content="Not Found")
     resp = await call_next(request)
     # 不加 CSP default-src：页面用了内联 script，严格 CSP 会直接打断；只加不会打断的防 framing / 嗅探头
     resp.headers["X-Frame-Options"] = "DENY"

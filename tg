@@ -8,6 +8,8 @@
 #   tg del            删除 api 配置（清空 api_id / api_hash）
 #   tg reset-password [新密码]  重置网页密码（不给参数就交互输入）
 #   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
+#   tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字路径）
+#   tg show-path      查看当前访问路径和完整地址（只在服务器终端显示）
 #   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
 #   tg uninstall      全部卸载（会提示输入 yes 确认）
 #   tg restart        重启服务
@@ -77,6 +79,14 @@ show_status() {
   else
     echo "域名：未绑定（用 tg domain 绑定）"
   fi
+  local _wp
+  _wp="$(get_val WEB_PATH 2>/dev/null)"
+  if [ -n "$_wp" ]; then
+    echo "访问路径：/$_wp"
+    echo "完整地址：$(web_url "$_wp")"
+  else
+    echo "访问路径：未设置（用 tg reset-path 生成24位路径）"
+  fi
   if [ ! -f "$ENV_FILE" ]; then
     echo "配置文件不存在：$ENV_FILE"
     echo "api_id：未配置"
@@ -139,6 +149,64 @@ do_set_hash() {
   fi
   set_val TG_API_HASH "$hash"
   echo "api_hash 已保存（终端里不回显完整值）。"
+  restart_service
+}
+
+web_url() {
+  local path="$1" dom="" ip=""
+  if [ -f /etc/nginx/conf.d/tgweb-domain.conf ]; then
+    dom=$(awk '$1=="server_name"{sub(/;$/,"",$2); print $2; exit}' /etc/nginx/conf.d/tgweb-domain.conf 2>/dev/null)
+  fi
+  if [ -n "$dom" ]; then
+    if [ -n "$path" ]; then echo "https://$dom/$path"; else echo "https://$dom"; fi
+    return
+  fi
+  # 没有绑域名时，优先用已有 HTTPS 站点的 server_name IP（云服务器 hostname -I 给的是内网 IP，外网打不开）
+  ip=$(grep -h "server_name" /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | awk '{print $2}' | tr -d ';' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  [ -z "$ip" ] && ip="服务器IP"
+  if [ -n "$path" ]; then echo "https://$ip/$path"; else echo "https://$ip"; fi
+}
+
+show_web_path() {
+  local wp
+  wp="$(get_val WEB_PATH)"
+  if [ -z "$wp" ]; then
+    echo "访问路径：未设置（直接用 IP/域名就能打开，强烈建议用 tg reset-path 生成一个24位路径）。"
+  else
+    echo "访问路径：/$wp"
+    echo "完整地址：$(web_url "$wp")"
+    echo "注意：这个路径是访问地址的一部分，只在服务器终端里显示，不要公开分享。"
+  fi
+}
+
+do_reset_web_path() {
+  local path="$1"
+  if [ -n "$path" ]; then
+    echo "注意：命令行里写的路径会留在 shell 历史里，下次请不带参数让它自动生成。"
+    if ! [[ "$path" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+      echo "路径只能含字母、数字、下划线、横线，1-64位。"
+      return 1
+    fi
+    case "$path" in
+      api|stream|thumb|photo|docs|favicon.ico|openapi.json)
+        echo "路径不能用 $path，这个名字已经被应用本身占用了。"
+        return 1
+        ;;
+    esac
+  else
+    path="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+    if [ "${#path}" != "24" ]; then
+      echo "生成随机路径失败，请重试。"
+      return 1
+    fi
+  fi
+  set_val WEB_PATH "$path"
+  echo "访问路径已重置：/$path"
+  echo "完整地址：$(web_url "$path")"
+  echo "注意：旧地址现在会 404，必须用新地址重新打开。"
   restart_service
 }
 
@@ -261,6 +329,8 @@ show_help() {
   echo "  tg del          删除 api 配置"
   echo "  tg reset-password [新密码]  重置网页密码"
   echo "  tg show-password  查看当前网页密码"
+  echo "  tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字）"
+  echo "  tg show-path      查看当前访问路径和完整地址"
   echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
   echo "  tg uninstall    全部卸载（会提示输入 yes 确认）"
   echo "  tg restart      重启服务"
@@ -281,8 +351,10 @@ menu() {
     echo "6) 重启服务"
     echo "7) 绑定/更换域名"
     echo "8) 卸载（全部删除）"
+    echo "9) 重置访问路径"
+    echo "10) 查看访问路径"
     echo "0) 退出"
-    read -r -p "选一个 [0-8]： " choice
+    read -r -p "选一个 [0-10]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -313,6 +385,12 @@ menu() {
       7)
         do_domain
         ;;
+      9)
+        do_reset_web_path ""
+        ;;
+      10)
+        show_web_path
+        ;;
       8)
         do_uninstall
         if [ $? -eq 0 ]; then
@@ -325,7 +403,7 @@ menu() {
         break
         ;;
       *)
-        echo "没有这个选项，选 0-8。"
+        echo "没有这个选项，选 0-10。"
         ;;
     esac
   done
@@ -338,6 +416,8 @@ case "${1:-}" in
   del) do_del ;;
   reset-password|reset-pw) do_reset_web_password "${2:-}" ;;
   show-password|view-password|show-pw|view-pw) show_web_password ;;
+  reset-path) do_reset_web_path "${2:-}" ;;
+  show-path|view-path|show-p) show_web_path ;;
   domain) do_domain "${@:2}" ;;
   uninstall) do_uninstall "${2:-}" ;;
   restart) restart_service ;;
