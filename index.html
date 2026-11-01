@@ -169,10 +169,19 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
     <button class="toggle-btn" onclick="switchToVideo()">视频</button>
     <button id="joinBtnChat" class="toggle-btn hidden" onclick="joinCurrentChannel()">加入</button>
   </div>
+  <div class="row" style="padding:8px 10px">
+  <input id="chatSearchInput" placeholder="在频道里搜索消息…" style="flex:1">
+  <button onclick="searchChatMessages()">搜索消息</button>
+  <button id="clearChatSearchBtn" class="hidden" onclick="clearChatSearch()">× 清除</button>
+  </div>
   <div id="chatLoadMoreWrap" class="hidden" style="text-align:center;margin:10px 0">
     <button id="chatLoadMoreBtn" onclick="loadOlderChat()">加载更早的消息</button>
   </div>
   <div id="chatMessages"></div>
+  <div id="chatSearchNextWrap" class="hidden" style="text-align:center;margin:16px 0">
+    <button id="chatSearchNextBtn" onclick="loadMoreSearchMessages()">下一页</button>
+    <span id="chatSearchNextStatus" class="muted"></span>
+  </div>
   <div class="chat-input-row">
     <input id="chatInput" placeholder="输入消息…">
     <button onclick="sendChatMessage()">发送</button>
@@ -314,21 +323,36 @@ async function submitPassword(){
   }catch(e){ alert(e.message); }
 }
 async function logout(){ try{ await api('/api/logout',{method:'POST'}); }catch(e){} await refreshStatus(); }
-function hideSearchResults(){ document.getElementById('searchResults').innerHTML = ''; }
+let searchResultsCache = [];
+let searchPage = 0;
+const SEARCH_PAGE_SIZE = 30;
+function hideSearchResults(){ searchResultsCache = []; searchPage = 0; document.getElementById('searchResults').innerHTML = ''; }
+function renderSearchPage(){
+  const box = document.getElementById('searchResults');
+  if (!searchResultsCache.length) { box.innerHTML = '<div class="muted">没搜到。私密订阅搜不到是正常的，用邀请链接直接加入。</div>'; return; }
+  const start = searchPage * SEARCH_PAGE_SIZE;
+  const page = searchResultsCache.slice(start, start + SEARCH_PAGE_SIZE);
+  const hasNext = start + SEARCH_PAGE_SIZE < searchResultsCache.length;
+  const hasPrev = searchPage > 0;
+  box.innerHTML = `<div style="text-align:right;margin-bottom:6px"><button onclick="hideSearchResults()" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + page.map(r=>
+    `<div class="item search-item" onclick="loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')"><b>${linkify(esc(r.title))}</b> ${r.username?`<a class="chat-link" onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">@${esc(r.username)}</a>`:''} <span class="muted">${esc(r.type)}</span><br>
+     <button onclick="event.stopPropagation();joinChannel('${r.username||r.id}')">加入</button>
+     <button onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">聊天</button>
+     <button onclick="event.stopPropagation();loadVideos(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">视频</button></div>`).join('')
+    + `<div style="text-align:center;margin:12px 0"><span class="muted">第 ${searchPage + 1} 页，共 ${searchResultsCache.length} 条</span><br>
+    ${hasPrev ? `<button onclick="searchPage--;renderSearchPage()" style="margin-top:6px;padding:6px 12px;font-size:13px">上一页</button> ` : ''}
+    ${hasNext ? `<button onclick="searchPage++;renderSearchPage()" style="margin-top:6px;padding:6px 12px;font-size:13px">下一页</button>` : (searchPage > 0 ? `<span class="muted" style="margin-left:8px">已经没有更多了</span>` : '')}</div>`;
+}
 async function doSearch(){
   const raw = document.getElementById('q').value.trim(); if(!raw) return;
-  // t.me/jisou、https://t.me/jisou 一律当成 @jisou 去搜
   let q = raw;
   const tm = raw.match(/t\.me\/([A-Za-z0-9_]+)/);
   if (tm && !raw.includes('/+') && !raw.includes('joinchat')) q = '@' + tm[1];
   try{
     const d = await api('/api/search?q='+encodeURIComponent(q));
-    document.getElementById('searchResults').innerHTML = d.results.length ? `<div style="text-align:right;margin-bottom:6px"><button onclick="hideSearchResults()" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + d.results.map(r=>
-      `<div class="item search-item" onclick="loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')"><b>${linkify(esc(r.title))}</b> ${r.username?`<a class="chat-link" onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">@${esc(r.username)}</a>`:''} <span class="muted">${esc(r.type)}</span><br>
-       <button onclick="event.stopPropagation();joinChannel('${r.username||r.id}')">加入</button>
-       <button onclick="event.stopPropagation();loadChat(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">聊天</button>
-       <button onclick="event.stopPropagation();loadVideos(${r.id},'${esc(r.title)}','${esc(r.username||'')}')">视频</button></div>`).join('')
-      : '<div class="muted">没搜到。私密订阅搜不到是正常的，用邀请链接直接加入。</div>';
+    searchResultsCache = d.results || [];
+    searchPage = 0;
+    renderSearchPage();
   }catch(e){ alert(e.message); await refreshStatus(); }
 }
 async function joinChannel(ch){
@@ -457,6 +481,10 @@ async function loadChat(channelId, title, username=''){
   document.getElementById('chatTitle').textContent = title || '频道';
   document.getElementById('chatMessages').innerHTML = '正在加载…';
   document.getElementById('chatLoadMoreWrap').classList.add('hidden');
+  chatSearching = false; chatSearchQ = ''; chatSearchOffset = 0; chatSearchHasMore = false;
+  const csi = document.getElementById('chatSearchInput'); if (csi) csi.value = '';
+  document.getElementById('clearChatSearchBtn').classList.add('hidden');
+  document.getElementById('chatSearchNextWrap').classList.add('hidden');
   chatOldestId = 0; chatHasMore = false;
   showView('chatView');
   window.scrollTo({top:0,behavior:'smooth'});
@@ -492,6 +520,62 @@ async function loadChatPage(appendOlder){
   chatLoading = false;
 }
 async function loadOlderChat(){ await loadChatPage(true); }
+let chatSearchQ = '';
+let chatSearchOffset = 0;
+let chatSearchHasMore = false;
+let chatSearchLoading = false;
+let chatSearching = false;
+async function searchChatMessages(){
+  const q = document.getElementById('chatSearchInput').value.trim();
+  if (!q || !currentChatChannelId) return;
+  chatSearching = true; chatSearchQ = q; chatSearchOffset = 0; chatSearchHasMore = false;
+  document.getElementById('clearChatSearchBtn').classList.remove('hidden');
+  document.getElementById('chatLoadMoreWrap').classList.add('hidden');
+  await loadSearchPage(false);
+}
+async function loadSearchPage(append){
+  if (chatSearchLoading) return;
+  chatSearchLoading = true;
+  const btn = document.getElementById('chatSearchNextBtn');
+  if (append) { btn.disabled = true; btn.textContent = '正在加载…'; }
+  try{
+    const d = await api(`/api/search-messages?channel_id=${currentChatChannelId}&q=${encodeURIComponent(chatSearchQ)}&limit=30&offset_id=${chatSearchOffset}` + (currentChannelUsername ? `&username=${encodeURIComponent(currentChannelUsername)}` : ''));
+    const box = document.getElementById('chatMessages');
+    if (!append) {
+      box.innerHTML = d.messages.length ? d.messages.map(m=>chatBubble(m, currentChatChannelId)).join('')
+        : '<div class="muted">没搜到这个关键词。</div>';
+    } else if (d.messages.length) {
+      const oldCount = box.children.length;
+      box.insertAdjacentHTML('beforeend', d.messages.map(m=>chatBubble(m, currentChatChannelId)).join(''));
+      const firstNew = box.children[oldCount];
+      if (firstNew) firstNew.scrollIntoView({behavior:'smooth', block:'start'});
+    }
+    chatSearchHasMore = !!d.has_more;
+    chatSearchOffset = d.next_offset_id || chatSearchOffset;
+    const wrap = document.getElementById('chatSearchNextWrap');
+    if (chatSearchHasMore) {
+      wrap.classList.remove('hidden');
+      btn.disabled = false; btn.textContent = '下一页';
+      document.getElementById('chatSearchNextStatus').textContent = '';
+    } else if (append) {
+      wrap.classList.remove('hidden');
+      btn.disabled = true; btn.textContent = '已经没有更多了';
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }catch(e){ alert(e.message); await refreshStatus(); }
+  chatSearchLoading = false;
+}
+async function loadMoreSearchMessages(){ await loadSearchPage(true); }
+function clearChatSearch(){
+  chatSearching = false; chatSearchQ = ''; chatSearchOffset = 0; chatSearchHasMore = false;
+  document.getElementById('chatSearchInput').value = '';
+  document.getElementById('clearChatSearchBtn').classList.add('hidden');
+  document.getElementById('chatSearchNextWrap').classList.add('hidden');
+  chatOldestId = 0; chatHasMore = false;
+  loadChatPage(false);
+}
+document.getElementById('chatSearchInput').addEventListener('keydown', e=>{ if(e.key==='Enter') searchChatMessages(); });
 async function sendChatMessage(){
   const input = document.getElementById('chatInput');
   const text = input.value.trim();

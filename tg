@@ -9,6 +9,7 @@
 #   tg reset-password [新密码]  重置网页密码（不给参数就交互输入）
 #   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
 #   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
+#   tg uninstall      全部卸载（会提示输入 yes 确认）
 #   tg restart        重启服务
 #   tg help           帮助
 # 改完 api_id / api_hash / 删除后会自动重启服务，不用再手动 docker compose。
@@ -191,6 +192,49 @@ do_domain() {
   bash "$script" "$@"
 }
 
+do_uninstall() {
+  local confirm=""
+  if [ "${1:-}" = "yes" ]; then
+    confirm="yes"
+  else
+    echo "全部卸载会删除："
+    echo "  容器和镜像、$APP_DIR（含 .env、登录 session、代码）"
+    echo "  /usr/local/bin/tg、/usr/local/bin/tg-domain"
+    echo "  Nginx 域名配置 /etc/nginx/conf.d/tgweb-domain.conf"
+    echo "  Nginx 里反代 127.0.0.1:8000 的 video 站点（如果有）"
+    echo "  注意：Docker 本身、证书（/root/cert）、其他服务不会动。"
+    read -r -p "确认全部卸载吗？输入 yes 确认（其他输入取消）： " confirm
+  fi
+  if [ "$confirm" != "yes" ]; then
+    echo "已取消。"
+    return 1
+  fi
+  if [ -z "$APP_DIR" ] || [ "$APP_DIR" = "/" ]; then
+    echo "安装目录不对，已取消。"
+    return 1
+  fi
+  echo "正在卸载……"
+  if [ -f "$COMPOSE_FILE" ] && command -v docker >/dev/null 2>&1; then
+    (cd "$APP_DIR" && docker compose down --rmi all -v 2>/dev/null || docker compose down 2>/dev/null) || true
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    docker rm -f telegram-stream-tg-stream-1 2>/dev/null || true
+    docker rmi telegram-stream-tg-stream 2>/dev/null || true
+  fi
+  rm -f /etc/nginx/conf.d/tgweb-domain.conf
+  for f in /etc/nginx/sites-available/video /etc/nginx/sites-enabled/video; do
+    if [ -f "$f" ] && grep -q "127.0.0.1:8000" "$f" 2>/dev/null; then
+      rm -f "$f"
+    fi
+  done
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+  fi
+  rm -rf "$APP_DIR"
+  rm -f /usr/local/bin/tg /usr/local/bin/tg-domain
+  echo "已全部卸载。"
+}
+
 show_help() {
   echo "tg - 视频库服务器快捷命令"
   echo "  tg              交互菜单"
@@ -201,6 +245,7 @@ show_help() {
   echo "  tg reset-password [新密码]  重置网页密码"
   echo "  tg show-password  查看当前网页密码"
   echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
+  echo "  tg uninstall    全部卸载（会提示输入 yes 确认）"
   echo "  tg restart      重启服务"
   echo "  tg help         帮助"
 }
@@ -218,8 +263,9 @@ menu() {
     echo "5) 查看网页密码"
     echo "6) 重启服务"
     echo "7) 绑定/更换域名"
+    echo "8) 卸载（全部删除）"
     echo "0) 退出"
-    read -r -p "选一个 [0-7]： " choice
+    read -r -p "选一个 [0-8]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -250,12 +296,19 @@ menu() {
       7)
         do_domain
         ;;
+      8)
+        do_uninstall
+        if [ $? -eq 0 ]; then
+          echo "已卸载，退出。"
+          break
+        fi
+        ;;
       0|"")
         echo "退出。"
         break
         ;;
       *)
-        echo "没有这个选项，选 0-7。"
+        echo "没有这个选项，选 0-8。"
         ;;
     esac
   done
@@ -269,6 +322,7 @@ case "${1:-}" in
   reset-password|reset-pw) do_reset_web_password "${2:-}" ;;
   show-password|view-password|show-pw|view-pw) show_web_password ;;
   domain) do_domain "${@:2}" ;;
+  uninstall) do_uninstall "${2:-}" ;;
   restart) restart_service ;;
   help|-h|--help) show_help ;;
   "") menu ;;

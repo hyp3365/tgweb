@@ -201,7 +201,7 @@ async def search(request: Request, q: str):
             pass
     # 2) Telegram 全局搜索（公开频道/群组/用户）
     try:
-        res = await client(SearchRequest(q=search_q, limit=20))
+        res = await client(SearchRequest(q=search_q, limit=50))
         for c in res.chats:
             add(c)
     except Exception:
@@ -214,7 +214,7 @@ async def search(request: Request, q: str):
                 add(dialog.entity)
     except Exception:
         pass
-    return {"results": results[:30]}
+    return {"results": results[:100]}
 
 
 
@@ -495,6 +495,29 @@ async def messages(request: Request, channel_id: int, limit: int = 30, offset_id
     if has_more:
         out = out[:limit]
     # 返回最新在前，前端聊天页翻转成从旧到新显示
+    return {"messages": out, "has_more": has_more,
+            "next_offset_id": out[-1]["msg_id"] if has_more and out else None}
+
+
+@app.get("/api/search-messages")
+async def search_messages(request: Request, channel_id: int, q: str, limit: int = 30, offset_id: int = 0, username: str | None = None):
+    check_web_auth(request)
+    client = await require_login()
+    limit = max(1, min(limit, 100))
+    q = (q or "").strip()
+    if not q:
+        return {"messages": [], "has_more": False, "next_offset_id": None}
+    entity = await _channel_entity(client, channel_id, username)
+    out = []
+    async for msg in client.iter_messages(entity, search=q, limit=(limit + 1) * 2, offset_id=offset_id):
+        info = _message_info(msg)
+        if info:
+            out.append(info)
+        if len(out) > limit:
+            break
+    has_more = len(out) > limit
+    if has_more:
+        out = out[:limit]
     return {"messages": out, "has_more": has_more,
             "next_offset_id": out[-1]["msg_id"] if has_more and out else None}
 
