@@ -10,12 +10,13 @@ import os
 import re
 import secrets
 import time
+from collections import OrderedDict
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FileReferenceExpiredError, FloodWaitError, SessionPasswordNeededError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -671,17 +672,17 @@ async def _get_message(client, channel_id, msg_id, username=None):
 # 原图 1～2MB 一张最坏吃一两百 MB，清完又全部重新下。改成按总字节淘汰最久没用的，
 # 缩略图 20MB、原图 50MB；单张超上限的不缓存，避免一张大图把整个缓存挤空。
 class _BytesLRU:
+    # OrderedDict 版：get/put 的“移到最新”都是 O(1)，不再用列表 remove（O(n) 线性扫描）。
+    # 淘汰从最旧一端 pop，同样 O(1)，总字节数单独记，不用每次求和。
     def __init__(self, max_bytes):
         self.max_bytes = max_bytes
-        self._data = {}
-        self._order = []
+        self._data = OrderedDict()
         self._total = 0
 
     def get(self, key):
         if key not in self._data:
             return None
-        self._order.remove(key)
-        self._order.append(key)
+        self._data.move_to_end(key)
         return self._data[key]
 
     def put(self, key, data):
@@ -690,13 +691,12 @@ class _BytesLRU:
             return
         if key in self._data:
             self._total -= len(self._data[key])
-            self._order.remove(key)
+            del self._data[key]
         self._data[key] = data
-        self._order.append(key)
         self._total += size
-        while self._total > self.max_bytes and self._order:
-            old = self._order.pop(0)
-            self._total -= len(self._data.pop(old))
+        while self._total > self.max_bytes and self._data:
+            _old_key, old_data = self._data.popitem(last=False)
+            self._total -= len(old_data)
 
 
 def _video_info(msg):
@@ -1127,65 +1127,123 @@ async def _download_one_chunk(client, media, total, chunk_start, chunk_len):
                     pass
 
 
-async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_id=None):
-    # 按 512KB 对齐块并行下，窗口 = 并行数 × 512KB（默认 2 → 1MB 窗口，改到 4 → 2MB 窗口），
-    # 窗口内各块并发下、按顺序回，内存最多只占一个窗口，不会把整文件先缓冲完。
+async def _refresh_media(client, channel_id, msg_id, username=None):
+    # FileReference 过期时用：跳过消息缓存，删掉旧缓存再重新 get_messages 取一次，
+    # 新消息里的媒体引用是新的，旧引用再下就会一直过期。取不到就返回 None，调用方再报错。
+    if channel_id is None or msg_id is None:
+        return None
+    _msg_cache.pop((channel_id, msg_id), None)
+    try:
+        msg = await _get_message(client, channel_id, msg_id, username)
+    except Exception:
+        return None
+    return msg.media if msg is not None else None
+
+
+async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_id=None, username=None):
+    # 滑动窗口并行下，不再是“分组”：窗口 = 并行数 × 512KB（默认 2 → 1MB，改到 4 → 2MB），
+    # 始终保持并行数个块在下载，最前面一块一交给浏览器就立刻补发下一块，不用等整组都回来。
+    # 以前是分组：并行 2 时 A 快 B 慢，A 交出后要等 B 回来才开始下 C，C 的下载和 B 的等待是串行的；
+    # 现在 A 一交出 C 就开始和 B 并行下，B 交出后 D 也立刻开始，组与组之间那个完整往返的空档没了。
+    # 内存不变：同一时刻在途的还是并行数个块（已下完但还没按顺序交出的块本来就在窗口里），
+    # 并发数也不变：新块只在旧块交出时补发，不是一口气全发出去，全局信号量还是 4 封顶。
     # 起点不对齐时：先从对齐起点下首块、自己裁掉前面的 skip，只浪费首块前面不到 512KB，
     # 后面所有块都是对齐的，不会像直接把不对齐起点交给 Telethon 那样每块都多下 512KB。
-    # 浏览器断开/拖进度时，生成器被取消，当前窗口没下完的任务一并取消，不会继续白下 Telegram 的流量。
+    # 播放中途报错有重试（只针对已经开始发的流，开始前取消息失败还是直接报 HTTP 错）：
+    # FloodWait 且 seconds <= 5：原地 sleep 这么久后重试这一块，超过 5 秒或重试 3 次还不行就报错断流；
+    # FileReferenceExpired：跳过消息缓存重取一次消息，用新媒体引用重试这一块，最多重取 2 次。
+    # 浏览器断开/拖进度时，生成器被取消，在途任务一并取消，不会继续白下 Telegram 的流量。
     aligned_start = (start // _CHUNK) * _CHUNK
     skip = start - aligned_start
-    cur = aligned_start
-    first = True
+    specs = []
+    p = aligned_start
+    while p <= end:
+        # 首块的下载长度：从对齐起点到请求终点（不超过一整块），调用方再裁掉前面的 skip；
+        # 其余块就是本块在请求范围内的长度（最后一块可能不足 512KB）。
+        # 注意不能用 total-p：小范围（比如 Safari 0-1 探测）终点就在首块内，用 total 会多回一整块，超 Content-Length。
+        if p == aligned_start:
+            dl_len = min(_CHUNK, end - aligned_start + 1)
+        else:
+            dl_len = min(_CHUNK, end - p + 1)
+        specs.append((p, dl_len))
+        p += _CHUNK
+    if not specs:
+        return
+    cur_media = media
+    in_flight = {}
+    next_to_issue = 0
+    next_to_yield = 0
     head_buf = bytearray()
-    while cur <= end:
-        window_end = min(cur + PARALLEL * _CHUNK - 1, end)
-        # 本窗口的块：首块可能要从对齐起点下整块再裁 skip，其余块按 512KB 切
-        specs = []
-        p = cur
-        while p <= window_end:
-            # 首块的下载长度：从对齐起点到请求终点（不超过一整块），调用方再裁掉前面的 skip；
-            # 其余块就是本块在请求范围内的长度（最后一块可能不足 512KB）。
-            # 注意不能用 total-p：小范围（比如 Safari 0-1 探测）终点就在首块内，用 total 会多回一整块，超 Content-Length。
-            if first and p == aligned_start:
-                dl_len = min(_CHUNK, end - aligned_start + 1)
-            else:
-                dl_len = min(_CHUNK, end - p + 1)
-            specs.append((p, dl_len))
-            p += _CHUNK
-        tasks = [asyncio.create_task(_download_one_chunk(client, media, total, s, l)) for s, l in specs]
-        try:
-            for idx, task in enumerate(tasks):
-                data = await task
-                if not data:
+
+    def _issue(idx):
+        s, l = specs[idx]
+        in_flight[idx] = asyncio.create_task(_download_one_chunk(client, cur_media, total, s, l))
+
+    try:
+        while next_to_issue < min(PARALLEL, len(specs)):
+            _issue(next_to_issue)
+            next_to_issue += 1
+        while next_to_yield < len(specs):
+            idx = next_to_yield
+            flood_retries = 0
+            ref_retries = 0
+            while True:
+                try:
+                    data = await in_flight[idx]
                     break
-                if first and idx == 0 and skip:
-                    data = data[skip:]
-                    if not data:
+                except asyncio.CancelledError:
+                    raise
+                except FloodWaitError as e:
+                    secs = getattr(e, "seconds", None)
+                    if secs is not None and secs <= 5 and flood_retries < 3:
+                        flood_retries += 1
+                        try:
+                            await asyncio.sleep(secs)
+                        except asyncio.CancelledError:
+                            raise
+                        _issue(idx)
                         continue
-                if start == 0 and first and idx == 0 and channel_id is not None:
-                    # 起点是 0 时首块就是头缓存：只有攒满 512KB（或文件本身不足 512KB）才存，
-                    # 小探测不会把 2 字节的头存进去覆盖旧的
-                    head_buf.extend(data[:_HEAD_SIZE - len(head_buf)])
-                    if len(head_buf) >= _HEAD_SIZE or len(head_buf) == total:
-                        _head_cache.put((channel_id, msg_id), bytes(head_buf))
-                yield data
-                if len(data) == 0:
-                    break
-            else:
-                # 本窗口完整下完才进下一窗口；中途 data 为空 break 时直接结束，不再继续要后面的窗口
-                cur = window_end + 1
-                first = False
-                continue
-            break
-        except asyncio.CancelledError:
-            for t in tasks:
-                t.cancel()
-            raise
-        except Exception:
-            for t in tasks:
-                t.cancel()
-            raise
+                    raise
+                except FileReferenceExpiredError:
+                    if ref_retries < 2:
+                        ref_retries += 1
+                        new_media = await _refresh_media(client, channel_id, msg_id, username)
+                        if new_media is not None:
+                            cur_media = new_media
+                            _issue(idx)
+                            continue
+                    raise
+            # 这一块交出去了，窗口空出一个名额，立刻补发下一块（如果还有的话）
+            del in_flight[idx]
+            next_to_yield += 1
+            if next_to_issue < len(specs):
+                _issue(next_to_issue)
+                next_to_issue += 1
+            if not data:
+                break
+            if idx == 0 and skip:
+                data = data[skip:]
+                if not data:
+                    continue
+            if start == 0 and idx == 0 and channel_id is not None:
+                # 起点是 0 时首块就是头缓存：只有攒满 512KB（或文件本身不足 512KB）才存，
+                # 小探测不会把 2 字节的头存进去覆盖旧的
+                head_buf.extend(data[:_HEAD_SIZE - len(head_buf)])
+                if len(head_buf) >= _HEAD_SIZE or len(head_buf) == total:
+                    _head_cache.put((channel_id, msg_id), bytes(head_buf))
+            yield data
+    except asyncio.CancelledError:
+        for t in in_flight.values():
+            t.cancel()
+        if in_flight:
+            await asyncio.gather(*in_flight.values(), return_exceptions=True)
+        raise
+    except Exception:
+        for t in in_flight.values():
+            t.cancel()
+        if in_flight:
+            await asyncio.gather(*in_flight.values(), return_exceptions=True)
+        raise
     return
 
 
@@ -1233,7 +1291,8 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
 
         async def gen_cached():
             yield cached_part
-            async for chunk in _parallel_gen(client, media, total, remainder_start, end):
+            async for chunk in _parallel_gen(client, media, total, remainder_start, end,
+                                             channel_id=channel_id, msg_id=msg_id, username=username):
                 yield chunk
 
         return StreamingResponse(gen_cached(), status_code=206 if range_header else 200,
@@ -1241,7 +1300,7 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
 
     # 正常路径也走并行：单连接只有几百 KB/s，并行 2 默认就能翻倍左右，改到 4 最多翻 4 倍（受 Telegram 单连接限速和服务器带宽制约）。
     # 注意 Content-Length 还是按 length 算，并行生成器保证回的字节数正好是 length，不多不少。
-    gen = _parallel_gen(client, media, total, start, end, channel_id=channel_id, msg_id=msg_id)
+    gen = _parallel_gen(client, media, total, start, end, channel_id=channel_id, msg_id=msg_id, username=username)
     if range_header:
         return StreamingResponse(gen, status_code=206, media_type=mime, headers=headers)
     return StreamingResponse(gen, media_type=mime, headers=headers)
