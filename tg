@@ -12,6 +12,11 @@
 #   tg show-path      查看当前访问路径和完整地址（只在服务器终端显示）
 #   tg set-parallel [1-4]  设置并行下载数（默认 2，最大 4）
 #   tg show-parallel  查看当前并行下载数
+#   tg set-backup-repo owner/repo  设置私有备份仓库（session 加密后同步到这里）
+#   tg set-backup-token  设置 GitHub Token（只给备份仓库 Contents 读写权限）
+#   tg show-backup      查看备份配置（Token 只显示掩码）
+#   tg sync-session     把本地 session 加密同步到私有备份仓库（只在 tg 命令里操作）
+#   tg restore-session  从私有备份仓库恢复 session（只在 tg 命令里操作）
 #   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
 #   tg uninstall      全部卸载（会提示输入 yes 确认）
 #   tg restart        重启服务
@@ -110,6 +115,13 @@ show_status() {
     echo "并行下载数：2（默认）"
   else
     echo "并行下载数：$par"
+  fi
+  local brepo
+  brepo="$(get_val GITHUB_BACKUP_REPO)"
+  if [ -z "$brepo" ]; then
+    echo "备份仓库：未设置（用 tg set-backup-repo 设置私有仓库）"
+  else
+    echo "备份仓库：$brepo"
   fi
   if [ -f "$APP_DIR/data/tg.session" ]; then
     echo "登录 session：已存在（data/tg.session）"
@@ -290,6 +302,191 @@ do_set_parallel() {
   restart_service
 }
 
+show_backup() {
+  local repo tok
+  repo="$(get_val GITHUB_BACKUP_REPO)"
+  tok="$(get_val GITHUB_BACKUP_TOKEN)"
+  if [ -z "$repo" ]; then
+    echo "备份仓库：未设置（用 tg set-backup-repo 设置，格式 owner/repo，必须是私有仓库）"
+  else
+    echo "备份仓库：$repo"
+  fi
+  echo "GitHub Token：$(mask_hash "$tok")"
+  if [ -f "$APP_DIR/data/tg.session" ]; then
+    echo "本地 session：已存在（data/tg.session）"
+  else
+    echo "本地 session：不存在（还没在网页上登录过）"
+  fi
+  echo "说明：同步/恢复只在 tg 命令里操作，仓库里只放加密后的 tg.session.enc，原始 session 不进仓库；备份密码只在终端里输入，不存在仓库、不发到聊天，丢了就恢复不了。"
+}
+
+do_set_backup_repo() {
+  local repo="$1"
+  if [ -z "$repo" ]; then
+    read -r -p "备份仓库（格式 owner/repo，必须是私有仓库）： " repo
+  fi
+  if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "备份仓库格式不对，应该是 owner/repo，例如 hyp3365/tgweb-backup。"
+    return 1
+  fi
+  set_val GITHUB_BACKUP_REPO "$repo"
+  echo "备份仓库已设为 $repo。"
+  echo "注意：这个仓库必须是私有的，同步/恢复时会先查一次仓库是不是私有，公开仓库会直接拒绝。"
+}
+
+do_set_backup_token() {
+  local tok="$1"
+  if [ -n "$tok" ]; then
+    echo "注意：命令行里写的 Token 会留在 shell 历史里，下次请不带参数交互输入。"
+  else
+    read -r -s -p "GitHub Token（输入时不显示，只给这个备份仓库 Contents 读写权限的细粒度 Token）： " tok
+    echo ""
+  fi
+  if [ -z "$tok" ]; then
+    echo "Token 不能为空，已取消。"
+    return 1
+  fi
+  set_val GITHUB_BACKUP_TOKEN "$tok"
+  echo "GitHub Token 已保存（终端里不回显完整值）。"
+  echo "注意：Token 只存在本机 .env 里（600 权限），不会进代码仓库；Token 过期后同步/恢复会报 401，到时重新设一个新 Token 就行。"
+  unset tok
+}
+
+# 查备份仓库：输出两行 private(true/false) 和 default_branch，失败时打印简短原因（不含 Token）并返回非 0。
+# Token 不进命令行：写进临时 curl 配置文件（600 权限），curl -K 读它，ps 里看不到 Token。
+_github_backup_repo_info() {
+  local repo="$1" tok="$2" tmpdir="$3" body http
+  printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\nheader = "X-GitHub-Api-Version: 2022-11-28"\n' "$tok" > "$tmpdir/curl.conf"
+  chmod 600 "$tmpdir/curl.conf"
+  body="$(curl -s -K "$tmpdir/curl.conf" -w "\n%{http_code}" "https://api.github.com/repos/$repo" 2>/dev/null)"
+  http="$(echo "$body" | tail -1)"
+  body="$(echo "$body" | sed '$d')"
+  if [ "$http" = "401" ]; then echo "GitHub Token 无效或已过期（401），请用 tg set-backup-token 重新设一个。"; return 1; fi
+  if [ "$http" = "404" ]; then echo "备份仓库不存在，或者 Token 没有这个仓库的权限（404），请检查仓库名和 Token 权限。"; return 1; fi
+  if [ "$http" != "200" ]; then echo "查备份仓库失败（HTTP $http），请检查网络，稍后再试。"; return 1; fi
+  echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('private') else 'false'); print(d.get('default_branch') or 'main')" 2>/dev/null
+}
+
+do_sync_session() {
+  local repo tok sess tmpdir pw pw2 body http priv branch sha b64
+  repo="$(get_val GITHUB_BACKUP_REPO)"
+  tok="$(get_val GITHUB_BACKUP_TOKEN)"
+  if [ -z "$repo" ] || [ -z "$tok" ]; then
+    echo "备份仓库或 Token 还没设，先跑 tg set-backup-repo 和 tg set-backup-token（都在服务器终端里输，不发到聊天）。"
+    return 1
+  fi
+  sess="$APP_DIR/data/tg.session"
+  if [ ! -f "$sess" ]; then
+    echo "本地 session 不存在（$sess），还没在网页上登录过，没什么可同步的。"
+    return 1
+  fi
+  command -v curl >/dev/null 2>&1 || { echo "找不到 curl，请先装 curl。"; return 1; }
+  command -v openssl >/dev/null 2>&1 || { echo "找不到 openssl，请先装 openssl。"; return 1; }
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  body="$(_github_backup_repo_info "$repo" "$tok" "$tmpdir")"
+  if [ $? -ne 0 ]; then echo "$body"; rm -rf "$tmpdir"; unset tok; return 1; fi
+  priv="$(echo "$body" | sed -n '1p')"
+  branch="$(echo "$body" | sed -n '2p')"
+  if [ "$priv" != "true" ]; then
+    echo "这个仓库不是私有的，不能同步 session，换成私有仓库再试。"
+    rm -rf "$tmpdir"; unset tok; return 1
+  fi
+  read -r -s -p "备份密码（输入时不显示，恢复时也要输这个密码，丢了备份就恢复不了）： " pw
+  echo ""
+  read -r -s -p "再输一次确认： " pw2
+  echo ""
+  if [ -z "$pw" ]; then echo "密码不能为空，已取消。"; rm -rf "$tmpdir"; unset tok pw pw2; return 1; fi
+  if [ "$pw" != "$pw2" ]; then echo "两次输入不一致，已取消。"; rm -rf "$tmpdir"; unset tok pw pw2; return 1; fi
+  unset pw2
+  if [ "${#pw}" -lt 12 ]; then echo "注意：这个密码不到 12 位，加密强度不够，建议用 12 位以上的强密码（这次还是会继续同步）。"; fi
+  # 停容器，保证 session 文件完整落盘；同步完再重启，播放会短暂断一下，和其他 tg 重启一样
+  if [ -f "$COMPOSE_FILE" ]; then
+    (cd "$APP_DIR" && docker compose down) || { echo "停服务失败，已取消同步，服务没动。"; rm -rf "$tmpdir"; unset tok pw; return 1; }
+  fi
+  if ! printf '%s' "$pw" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$sess" -out "$tmpdir/tg.session.enc" -pass stdin 2>/dev/null; then
+    echo "加密失败，已取消。"
+    rm -rf "$tmpdir"; unset tok pw
+    if [ -f "$COMPOSE_FILE" ]; then (cd "$APP_DIR" && docker compose up -d) 2>/dev/null || true; fi
+    return 1
+  fi
+  body="$(curl -s -K "$tmpdir/curl.conf" -w "\n%{http_code}" "https://api.github.com/repos/$repo/contents/tg.session.enc?ref=$branch" 2>/dev/null)"
+  http="$(echo "$body" | tail -1)"
+  body="$(echo "$body" | sed '$d')"
+  sha=""
+  if [ "$http" = "200" ]; then sha="$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)"; fi
+  b64="$(base64 -w0 "$tmpdir/tg.session.enc" 2>/dev/null || base64 "$tmpdir/tg.session.enc" | tr -d '\n')"
+  if [ -n "$sha" ]; then
+    python3 -c "import json,sys; print(json.dumps({'message':'sync session','content':sys.argv[1],'sha':sys.argv[2],'branch':sys.argv[3]}))" "$b64" "$sha" "$branch" > "$tmpdir/payload.json"
+  else
+    python3 -c "import json,sys; print(json.dumps({'message':'sync session','content':sys.argv[1],'branch':sys.argv[2]}))" "$b64" "$branch" > "$tmpdir/payload.json"
+  fi
+  body="$(curl -s -K "$tmpdir/curl.conf" -w "\n%{http_code}" -X PUT -H "Content-Type: application/json" -d @"$tmpdir/payload.json" "https://api.github.com/repos/$repo/contents/tg.session.enc" 2>/dev/null)"
+  http="$(echo "$body" | tail -1)"
+  rm -rf "$tmpdir"; unset tok pw b64 sha
+  if [ -f "$COMPOSE_FILE" ]; then (cd "$APP_DIR" && docker compose up -d) 2>/dev/null || echo "警告：同步后重启服务失败，请手动跑 tg restart。"; fi
+  if [ "$http" = "201" ] || [ "$http" = "200" ]; then
+    echo "session 已同步到私有仓库 $repo（加密文件 tg.session.enc，原始 session 没进仓库）。"
+    return 0
+  else
+    echo "同步失败（HTTP $http），请检查 Token 权限和仓库名，服务已重启。"
+    return 1
+  fi
+}
+
+do_restore_session() {
+  local repo tok tmpdir pw body http priv branch
+  repo="$(get_val GITHUB_BACKUP_REPO)"
+  tok="$(get_val GITHUB_BACKUP_TOKEN)"
+  if [ -z "$repo" ] || [ -z "$tok" ]; then
+    echo "备份仓库或 Token 还没设，先跑 tg set-backup-repo 和 tg set-backup-token（都在服务器终端里输，不发到聊天）。"
+    return 1
+  fi
+  command -v curl >/dev/null 2>&1 || { echo "找不到 curl，请先装 curl。"; return 1; }
+  command -v openssl >/dev/null 2>&1 || { echo "找不到 openssl，请先装 openssl。"; return 1; }
+  tmpdir="$(mktemp -d)"
+  chmod 700 "$tmpdir"
+  body="$(_github_backup_repo_info "$repo" "$tok" "$tmpdir")"
+  if [ $? -ne 0 ]; then echo "$body"; rm -rf "$tmpdir"; unset tok; return 1; fi
+  priv="$(echo "$body" | sed -n '1p')"
+  branch="$(echo "$body" | sed -n '2p')"
+  if [ "$priv" != "true" ]; then
+    echo "这个仓库不是私有的，不能从这里恢复 session，换成私有仓库再试。"
+    rm -rf "$tmpdir"; unset tok; return 1
+  fi
+  printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github.raw"\n' "$tok" > "$tmpdir/curl-raw.conf"
+  chmod 600 "$tmpdir/curl-raw.conf"
+  http="$(curl -s -K "$tmpdir/curl-raw.conf" -o "$tmpdir/tg.session.enc" -w "%{http_code}" "https://api.github.com/repos/$repo/contents/tg.session.enc?ref=$branch" 2>/dev/null)"
+  if [ "$http" = "401" ]; then echo "GitHub Token 无效或已过期（401），请用 tg set-backup-token 重新设一个。"; rm -rf "$tmpdir"; unset tok; return 1; fi
+  if [ "$http" = "404" ]; then echo "备份仓库里没有 tg.session.enc，先在旧服务器上跑 tg sync-session 同步一次。"; rm -rf "$tmpdir"; unset tok; return 1; fi
+  if [ "$http" != "200" ]; then echo "下载备份失败（HTTP $http）。"; rm -rf "$tmpdir"; unset tok; return 1; fi
+  read -r -s -p "备份密码（同步时设的那个，输入时不显示）： " pw
+  echo ""
+  if [ -z "$pw" ]; then echo "密码不能为空，已取消。"; rm -rf "$tmpdir"; unset tok pw; return 1; fi
+  if ! printf '%s' "$pw" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$tmpdir/tg.session.enc" -out "$tmpdir/tg.session" -pass stdin 2>/dev/null; then
+    echo "解密失败：密码不对，或者备份文件损坏，现有 session 没动。"
+    rm -rf "$tmpdir"; unset tok pw; return 1
+  fi
+  unset pw
+  if ! head -c 16 "$tmpdir/tg.session" | grep -q "SQLite format 3"; then
+    echo "解密出来的文件不是 session 文件，恢复已取消，现有 session 没动。"
+    rm -rf "$tmpdir"; unset tok; return 1
+  fi
+  if [ -f "$COMPOSE_FILE" ]; then
+    (cd "$APP_DIR" && docker compose down) || { echo "停服务失败，已取消恢复。"; rm -rf "$tmpdir"; unset tok; return 1; }
+  fi
+  mkdir -p "$APP_DIR/data"
+  if [ -f "$APP_DIR/data/tg.session" ]; then
+    cp "$APP_DIR/data/tg.session" "$APP_DIR/data/tg.session.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    echo "现有 session 已备份到 data/tg.session.bak-时间戳，恢复出问题可以手动换回去。"
+  fi
+  cp "$tmpdir/tg.session" "$APP_DIR/data/tg.session"
+  chmod 600 "$APP_DIR/data/tg.session"
+  rm -rf "$tmpdir"; unset tok
+  if [ -f "$COMPOSE_FILE" ]; then (cd "$APP_DIR" && docker compose up -d) 2>/dev/null || echo "警告：恢复后重启服务失败，请手动跑 tg restart。"; fi
+  echo "session 已从私有仓库 $repo 恢复，打开网页输网页密码，应该直接显示已登录，不用收验证码。"
+}
+
 do_del() {
   set_val TG_API_ID "0"
   set_val TG_API_HASH "placeholder"
@@ -368,6 +565,11 @@ show_help() {
   echo "  tg show-path      查看当前访问路径和完整地址"
   echo "  tg set-parallel [1-4]  设置并行下载数（默认 2，最大 4）"
   echo "  tg show-parallel  查看当前并行下载数"
+  echo "  tg set-backup-repo owner/repo  设置私有备份仓库"
+  echo "  tg set-backup-token  设置 GitHub Token（只给备份仓库 Contents 读写）"
+  echo "  tg show-backup      查看备份配置（Token 只显示掩码）"
+  echo "  tg sync-session     把 session 加密同步到私有备份仓库"
+  echo "  tg restore-session  从私有备份仓库恢复 session"
   echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
   echo "  tg uninstall    全部卸载（会提示输入 yes 确认）"
   echo "  tg restart      重启服务"
@@ -397,8 +599,12 @@ menu() {
     echo "9) 重置访问路径"
     echo "10) 查看访问路径"
     echo "11) 设置并行下载数（1-4，默认 2）"
+    echo "12) 设置备份仓库（私有 GitHub 仓库）"
+    echo "13) 设置 GitHub Token"
+    echo "14) 同步 session 到备份仓库"
+    echo "15) 从备份仓库恢复 session"
     echo "0) 退出"
-    read -r -p "选一个 [0-11]： " choice
+    read -r -p "选一个 [0-15]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -438,6 +644,19 @@ menu() {
       11)
         do_set_parallel ""
         ;;
+      12)
+        read -r -p "备份仓库（owner/repo，必须私有）： " v
+        do_set_backup_repo "$v"
+        ;;
+      13)
+        do_set_backup_token ""
+        ;;
+      14)
+        do_sync_session
+        ;;
+      15)
+        do_restore_session
+        ;;
       8)
         do_uninstall
         if [ $? -eq 0 ]; then
@@ -450,11 +669,11 @@ menu() {
         break
         ;;
       *)
-        echo "没有这个选项，选 0-11。"
+        echo "没有这个选项，选 0-15。"
         ;;
     esac
     case "$choice" in
-      1|2|3|4|5|6|7|8|9|10|11)
+      1|2|3|4|5|6|7|8|9|10|11|12|13|14|15)
         pause_for_key
         ;;
     esac
@@ -472,6 +691,11 @@ case "${1:-}" in
   show-path|view-path|show-p) show_web_path ;;
   set-parallel) do_set_parallel "${2:-}" ;;
   show-parallel|view-parallel) show_parallel ;;
+  set-backup-repo) do_set_backup_repo "${2:-}" ;;
+  set-backup-token) if [ -n "${2:-}" ]; then echo "注意：命令行里写的 Token 会留在 shell 历史里，下次请不带参数交互输入。"; fi; do_set_backup_token "${2:-}" ;;
+  show-backup) show_backup ;;
+  sync-session|backup-session) do_sync_session ;;
+  restore-session) do_restore_session ;;
   domain) do_domain "${@:2}" ;;
   uninstall) do_uninstall "${2:-}" ;;
   restart) restart_service ;;

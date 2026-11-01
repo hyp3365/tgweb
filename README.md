@@ -18,6 +18,11 @@ tg reset-path
 tg show-path
 tg set-parallel [1-4]
 tg show-parallel
+tg set-backup-repo owner/repo
+tg set-backup-token
+tg show-backup
+tg sync-session
+tg restore-session
 tg domain [域名]
 tg uninstall
 tg restart
