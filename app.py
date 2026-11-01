@@ -968,6 +968,15 @@ def _parse_range(range_header: str | None, total: int):
     return start, min(total - 1, end)
 
 
+# 起播头缓存：每次点播放浏览器都会先要开头几百 KB 读视频信息（Safari 还会先发 bytes=0-1 探测）。
+# 内存里缓存最近视频的前 512KB（总共最多 50MB，复用图片的 _BytesLRU），探测和元数据请求不用再走 Telegram。
+# 只在本来就要下载 >=512KB 的请求里顺带攒满 512KB 才存，小探测（2 字节）不会为了攒缓存多下 Telegram 的流量，
+# 也不会用 2 字节的头把之前攒好的 512KB 覆盖掉。
+_HEAD_SIZE = 512 * 1024
+_RANGE_CAP = 4 * 1024 * 1024
+_head_cache = _BytesLRU(50 * 1024 * 1024)
+
+
 @app.get("/stream/{channel_id}/{msg_id}")
 async def stream(request: Request, channel_id: int, msg_id: int, username: str | None = None):
     check_web_auth(request)
@@ -981,28 +990,69 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
         raise HTTPException(status_code=404, detail="这条消息没有视频")
     total = doc.size
     mime = doc.mime_type or "video/mp4"
-    parsed = _parse_range(request.headers.get("range"), total)
+    range_header = request.headers.get("range")
+    parsed = _parse_range(range_header, total)
     if parsed is None:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
     start, end = parsed
+    # 开放式 Range（bytes=X-，不是后缀 bytes=-N、不是闭合 bytes=X-Y、不是无 Range）才封顶 4MB：
+    # 拖进度、关播放器时旧请求不用等发现断开才停，最多白费 4MB；浏览器拿到 206 + 真实 Content-Range 后
+    # 需要更多数据时会自己接着要下一段，播放不受影响。无 Range 的整文件请求不封顶，否则直接下载会被截断。
+    if range_header and re.fullmatch(r"bytes=\d+-", range_header.strip()):
+        end = min(end, start + _RANGE_CAP - 1)
     length = end - start + 1
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(length),
+               "Cache-Control": "private, no-store"}
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+
+    head = _head_cache.get((channel_id, msg_id))
+    if head is not None and start < len(head):
+        # 请求的整段都在已缓存的头里（Safari 探测、元数据小段）：直接回缓存，不走 Telegram
+        if length <= len(head) - start:
+            data = head[start:start + length]
+            if range_header:
+                return Response(content=data, status_code=206, media_type=mime, headers=headers)
+            return Response(content=data, media_type=mime, headers=headers)
+        # 头只覆盖前半段：先回缓存的头，再从 Telegram 接着拉剩余部分
+        cached_part = head[start:]
+        remainder_start = len(head)
+        remainder_length = length - len(cached_part)
+
+        async def gen_cached():
+            yield cached_part
+            remaining = remainder_length
+            async for chunk in client.iter_download(media, offset=remainder_start, file_size=total):
+                if remaining <= 0:
+                    break
+                chunk = chunk[:remaining]
+                remaining -= len(chunk)
+                yield chunk
+
+        return StreamingResponse(gen_cached(), status_code=206 if range_header else 200,
+                                 media_type=mime, headers=headers)
 
     async def gen():
         # Telethon 的 limit 是分块数，不是字节数，传 limit=length 会一直下到文件末尾，
         # 发出的数据比 Content-Length 多，uvicorn 会断开；Safari 发 bytes=0-1 探测时尤其明显。
         # 这里不传 limit，按字节截断，剩 0 就停。
         remaining = length
+        head_buf = bytearray()
+        head_stored = False
         async for chunk in client.iter_download(media, offset=start, file_size=total):
             if remaining <= 0:
                 break
             chunk = chunk[:remaining]
             remaining -= len(chunk)
             yield chunk
+            if start == 0 and not head_stored and len(head_buf) < _HEAD_SIZE:
+                head_buf.extend(chunk[:_HEAD_SIZE - len(head_buf)])
+                if len(head_buf) >= _HEAD_SIZE or (remaining == 0 and len(head_buf) == total):
+                    _head_cache.put((channel_id, msg_id), bytes(head_buf))
+                    head_stored = True
 
-    headers = {"Accept-Ranges": "bytes", "Content-Length": str(length),
-               "Cache-Control": "private, no-store"}
-    if request.headers.get("range"):
-        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    if range_header:
         return StreamingResponse(gen(), status_code=206, media_type=mime, headers=headers)
     return StreamingResponse(gen(), media_type=mime, headers=headers)
 

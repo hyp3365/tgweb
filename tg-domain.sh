@@ -187,10 +187,16 @@ server {
     listen [::]:443 ssl;
     server_name ${domain};
     server_tokens off;
+    http2 on;
+    gzip on;
+    gzip_proxied any;
+    gzip_types application/json text/css application/javascript;
     ssl_certificate     ${cert_file};
     ssl_certificate_key ${key_file};
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
     location / {
         proxy_pass ${APP_UPSTREAM};
         proxy_http_version 1.1;
