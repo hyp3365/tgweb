@@ -337,6 +337,12 @@ show_help() {
   echo "  tg help         帮助"
 }
 
+pause_for_key() {
+  echo ""
+  read -n 1 -s -r -p "按任意键返回菜单..." _key
+  echo ""
+}
+
 menu() {
   while true; do
     echo ""
@@ -404,6 +410,11 @@ menu() {
         ;;
       *)
         echo "没有这个选项，选 0-10。"
+        ;;
+    esac
+    case "$choice" in
+      1|2|3|4|5|6|7|8|9|10)
+        pause_for_key
         ;;
     esac
   done
