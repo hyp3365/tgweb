@@ -251,7 +251,7 @@ a.kb-btn{display:block}
   </div>
   <div class="chat-input-row">
     <input id="chatInput" placeholder="输入消息…">
-    <button onclick="sendChatMessage()">发送</button>
+    <button id="chatSendBtn" onclick="sendChatMessage()">发送</button>
   </div>
   </div>
 </div>
@@ -270,7 +270,7 @@ a.kb-btn{display:block}
   <div id="commentMessages"></div>
   <div class="chat-input-row">
     <input id="commentInput" placeholder="输入评论…">
-    <button onclick="sendComment()">发送</button>
+    <button id="commentSendBtn" onclick="sendComment()">发送</button>
   </div>
   </div>
 </div>
@@ -1037,15 +1037,34 @@ function clearChatSearch(){
   loadChatPage(false);
 }
 document.getElementById('chatSearchInput').addEventListener('keydown', e=>{ if(e.key==='Enter') searchChatMessages(); });
+// 发消息发两遍的原因就在这里，原来的 sendChatMessage 没有防重：
+// 1）输入框是等服务器返回后才清空的，发送请求要 1～2 秒，这期间再点一次发送
+//    或再按一次回车，输入框里还是同一句话，就会再发一次真正的请求，
+//    对方就收到两条一模一样的消息；
+// 2）3 秒轮询可能在发送返回之前就已经把这条消息拉下来显示了，发送返回后
+//    又不检查就再追加一条，页面上也会出现两条（即使服务器其实只收到一条）。
+// 修法：发送中加锁 + 按钮禁用 + 先清空输入框（失败再把原文恢复），
+// 返回后先查 chatDisplayedIds，轮询已经显示过的就不重复追加。
+let chatSending = false;
 async function sendChatMessage(){
+  if (chatSending) return;
   const input = document.getElementById('chatInput');
+  const btn = document.getElementById('chatSendBtn');
   const text = input.value.trim();
   if (!text) return;
+  chatSending = true;
+  if (btn) btn.disabled = true;
+  input.value = '';
   try{
     const d = await api('/api/send',{method:'POST', body:JSON.stringify({channel_id: currentChatChannelId, text, username: currentChannelUsername || null})});
     const box = document.getElementById('chatMessages');
     if (box.textContent.includes('还没有消息')) box.innerHTML = '';
     if (d.message && d.message.msg_id) {
+      if (chatDisplayedIds.has(d.message.msg_id)) {
+        chatMsgHash[d.message.msg_id] = msgHash(d.message);
+        if (d.message.msg_id > chatNewestId) chatNewestId = d.message.msg_id;
+        return;
+      }
       chatDisplayedIds.add(d.message.msg_id);
       chatMsgHash[d.message.msg_id] = msgHash(d.message);
       if (d.message.msg_id > chatNewestId) chatNewestId = d.message.msg_id;
@@ -1053,11 +1072,16 @@ async function sendChatMessage(){
     const lastMsgEl = box.querySelector('.chat-msg:last-child');
     const lastDate = lastMsgEl ? lastMsgEl.dataset.date : null;
     box.insertAdjacentHTML('beforeend', chatListHtml([d.message], lastDate));
-    input.value = '';
     input.scrollIntoView({behavior:'smooth', block:'end'});
-  }catch(e){ alert(e.message); }
+  }catch(e){
+    input.value = text;
+    alert(e.message);
+  }finally{
+    chatSending = false;
+    if (btn) btn.disabled = false;
+  }
 }
-document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChatMessage(); });
+document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); sendChatMessage(); } });
 
 // 评论页：原帖在频道，评论在讨论组，后端按原帖找到讨论组再按回复取评论。
 // 评论本身也是消息，所以直接复用聊天页的气泡（头像、名字、时间、图片、视频、按钮都在），
@@ -1120,10 +1144,18 @@ async function loadCommentPage(appendOlder){
   }catch(e){ box.innerHTML = '<div class="muted">' + esc(e.message) + '</div>'; }
 }
 async function loadOlderComments(){ await loadCommentPage(true); }
+// 评论发送和上面是同一个毛病：没有防重，请求没回来前再点一次就真发两条。
+// 同样加锁 + 禁用按钮 + 先清空输入框，失败恢复原文。
+let commentSending = false;
 async function sendComment(){
+  if (commentSending) return;
   const input = document.getElementById('commentInput');
+  const btn = document.getElementById('commentSendBtn');
   const text = input.value.trim();
   if (!text) return;
+  commentSending = true;
+  if (btn) btn.disabled = true;
+  input.value = '';
   try{
     const d = await api('/api/comment',{method:'POST', body:JSON.stringify({channel_id: commentChannelId, msg_id: commentMsgId, text, username: currentChannelUsername || null})});
     const box = document.getElementById('commentMessages');
@@ -1132,11 +1164,16 @@ async function sendComment(){
     const lastMsgEl = box.querySelector('.chat-msg:last-child');
     const lastDate = lastMsgEl ? lastMsgEl.dataset.date : null;
     box.insertAdjacentHTML('beforeend', chatListHtml([d.message], lastDate, commentDiscChannelId, ''));
-    input.value = '';
     input.scrollIntoView({behavior:'smooth', block:'end'});
-  }catch(e){ alert(e.message); }
+  }catch(e){
+    input.value = text;
+    alert(e.message);
+  }finally{
+    commentSending = false;
+    if (btn) btn.disabled = false;
+  }
 }
-document.getElementById('commentInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendComment(); });
+document.getElementById('commentInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); sendComment(); } });
 
 let kbCache = {};
 async function clickInlineBtn(channelId, msgId, row, col){
