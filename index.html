@@ -209,7 +209,7 @@ a.kb-btn{display:block}
   </section>
   <h2>所有频道</h2>
   <div id="channels" class="channels-grid muted">正在加载…</div>
-  <div id="tgwebVersionInfo" class="muted" style="margin-top:16px;font-size:12px">版本 防退出v4 · 历史条目加载中…</div>
+  <div id="tgwebVersionInfo" class="muted" style="margin-top:16px;font-size:12px">版本 防退出v5 · 历史条目加载中…</div>
 </div>
 
 <!-- 第四步：点击频道进入的新页面：该频道视频 -->
@@ -431,8 +431,23 @@ let tgwebSeq = 0;
 let tgwebPopping = false;
 function tgwebPushState(){
   if (tgwebPopping) return;
-  tgwebSeq++;
-  try{ history.pushState({tgweb:true, seq:tgwebSeq}, ''); }catch(e){}
+  // 关键改动：以前 push 的 URL 是空（和当前页同 URL），只有 state 不同。
+  // Chrome 的滑动返回（系统返回手势/预测返回）会跳过同 URL 的 state
+  // 条目，直接回到上一个不同 URL 的网站——这就是“内部序号 3→2→1
+  // 补满到 3、再滑一下就直接退出”的原因：前面几次是浏览器返回按钮
+  // /页面内返回在弹 state 条目，滑动返回却直接跳过了它们。
+  // 改成每次推一个不同的 hash URL（#tgweb-序号），hash 只改地址栏
+  // 后缀、不发请求、不影响服务端（pathname 不变），但对浏览器来说
+  // 每一条都是不同的历史条目，滑动返回就必须一条一条弹，不能跳过。
+  const nextSeq = tgwebSeq + 1;
+  try{
+    history.pushState({tgweb:true, seq:nextSeq}, '', '#tgweb-' + nextSeq);
+    tgwebSeq = nextSeq;
+  }catch(e){
+    // push 失败就不要把内部序号也加上去，不然脚注的内部序号和真实
+    // 历史条目数就对不上了，下次判断 seq==0 补推也会错。
+    return;
+  }
   try{ tgwebUpdateHistInfo(); }catch(e){}
 }
 window.addEventListener('popstate', (e)=>{
@@ -491,8 +506,10 @@ window.addEventListener('popstate', (e)=>{
 // 补推完应该再加 3，如果只减不加，就是补推还是没生效。
 let tgwebTrapTimer = null;
 function tgwebUpdateHistInfo(){
-  const el = document.getElementById('tgwebVersionInfo');
-  if (el) el.textContent = '版本 防退出v4 · 历史条目 ' + (history.length || 0) + ' · 内部序号 ' + tgwebSeq;
+  try{
+    const el = document.getElementById('tgwebVersionInfo');
+    if (el) el.textContent = '版本 防退出v5 · 历史条目 ' + (history.length || 0) + ' · 内部序号 ' + tgwebSeq + ' · ' + ((typeof location !== 'undefined' && location.hash) || '无hash');
+  }catch(e){}
 }
 function tgwebTrapLater(){
   if (tgwebTrapTimer) return;
