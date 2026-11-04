@@ -28,7 +28,13 @@ docker compose version >/dev/null 2>&1 || { echo "Docker Compose 未装好，请
 
 # 取代码：已有目录且不是 git 仓库时先备份，再全新克隆，并把旧 .env 和 data 拷回来
 if [ -d "$DIR/.git" ]; then
-  (cd "$DIR" && git pull --ff-only || echo "git pull 失败，继续用现有代码。")
+  # pull 失败就停下来，不要悄悄用旧代码继续构建：本地改动、分支分叉、网络中断
+  # 时继续装，装完显示“已启动”会让用户误以为已经是最新版。
+  if ! (cd "$DIR" && git pull --ff-only); then
+    echo "git pull 失败，已停止安装，没有用旧代码继续构建。"
+    echo "请先在 $DIR 里处理本地改动或分支分叉（git status / git stash），再重新运行安装。"
+    exit 1
+  fi
 elif [ -d "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
   BACKUP="${DIR}.bak.$(date +%Y%m%d%H%M%S)"
   mv "$DIR" "$BACKUP"
@@ -95,10 +101,18 @@ fi
 (cd "$DIR" && docker compose up -d --build)
 sleep 5
 docker compose -f "$DIR/docker-compose.yml" ps
-if curl -fsS http://127.0.0.1:8000/ >/dev/null 2>&1; then
+# 健康检查必须带 WEB_PATH：app 的中间件对不带访问路径的 / 直接回 404，
+# 以前这里裸 curl /，新装（一定会生成 WEB_PATH）永远报“启动检查失败”，其实服务是好的。
+_HEALTH_PATH="$(grep -E '^WEB_PATH=' "$DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+if [ -n "$_HEALTH_PATH" ]; then
+  _HEALTH_URL="http://127.0.0.1:8000/$_HEALTH_PATH"
+else
+  _HEALTH_URL="http://127.0.0.1:8000/"
+fi
+if curl -fsS "$_HEALTH_URL" >/dev/null 2>&1; then
   echo "服务已启动。"
 else
-  echo "服务启动检查失败，请在 $DIR 里看 docker compose logs。"
+  echo "服务启动检查失败（检查的是 $_HEALTH_URL），请在 $DIR 里看 docker compose logs。"
 fi
 # 8000 只绑回环，不直接对公网开放；不提供 HTTP 访问：安装后必须绑定域名或有证书的 IP，走 HTTPS 才能进应用
 # 旧的 HTTP 反代必须删掉，否则 HTTPS 会被 HTTP 明文绕过
@@ -107,7 +121,16 @@ if ! command -v nginx >/dev/null 2>&1; then
   apt-get install -y nginx 2>/dev/null || true
 fi
 # 已有 HTTPS 站点（tg domain 绑过的域名，或原来 IP 的 HTTPS 站）就保留不动，不用重新绑
-if grep -rq "listen 443 ssl" /etc/nginx/ 2>/dev/null && grep -rq "proxy_pass http://127.0.0.1:8000" /etc/nginx/ 2>/dev/null; then
+# 注意不能用两个跨文件的 grep 拼结果：一个文件有 443、另一个文件反代 8000，
+# 拼起来也会误判成“已有 tgweb 的 HTTPS 站”，然后直接退出不绑定，实际上 tgweb 根本没对外。
+_HAS_HTTPS=0
+for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+  if [ -f "$_f" ] && grep -q "listen 443 ssl" "$_f" 2>/dev/null && grep -q "proxy_pass http://127.0.0.1:8000" "$_f" 2>/dev/null; then
+    _HAS_HTTPS=1
+    break
+  fi
+done
+if [ "$_HAS_HTTPS" = "1" ]; then
   echo "检测到已有 HTTPS 站点，保留不动，继续用原来的 https 地址访问。"
   if [ -n "$NEW_PW" ]; then
     echo "网页密码（刚生成的，请记下来）：$NEW_PW"

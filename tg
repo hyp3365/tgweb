@@ -496,6 +496,9 @@ do_uninstall() {
     docker rmi telegram-stream-tg-stream 2>/dev/null || true
   fi
   rm -f /etc/nginx/conf.d/tgweb-domain.conf
+  # 旧版 HTTP 反代也顺带清掉：以前只删域名配置，残留的 tgweb.conf 还在反代 8000，
+  # 卸载后 nginx 一 reload 就会去连一个已经不存在的服务。
+  rm -f /etc/nginx/conf.d/tgweb.conf
   for f in /etc/nginx/sites-available/video /etc/nginx/sites-enabled/video; do
     if [ -f "$f" ] && grep -q "127.0.0.1:8000" "$f" 2>/dev/null; then
       rm -f "$f"

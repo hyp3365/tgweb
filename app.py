@@ -46,6 +46,32 @@ PARALLEL = _clamp_parallel(os.environ.get("TG_PARALLEL", "2"))
 _download_sem = asyncio.Semaphore(4)
 _web_sessions: dict = {}  # token -> expiry timestamp，cookie 本身不再是密码的哈希，泄露也推不出密码
 _web_attempts: dict = {}  # ip -> [失败时间戳]，10 分钟内 5 次失败就限流 10 分钟
+# Telegram 登录限流，和网页密码限流分开记：发验证码、验证码、二次密码各算一次，
+# 成功发码不算“清零”（否则反复发码就能绕开验证码爆破计数），只有整套登录成功才清。
+_tg_attempts: dict = {}  # ip -> [失败时间戳]
+
+
+def _tg_failures(ip):
+    now = time.time()
+    v = [ts for ts in _tg_attempts.get(ip, []) if now - ts < 600]
+    _tg_attempts[ip] = v
+    if len(_tg_attempts) > 1000:
+        for k in sorted(_tg_attempts.keys(), key=lambda x: min(_tg_attempts[x]) if _tg_attempts[x] else 0)[:500]:
+            _tg_attempts.pop(k, None)
+        v = _tg_attempts.get(ip, [])
+    return v
+
+
+def _tg_rate_limited(ip):
+    return len(_tg_failures(ip)) >= 5
+
+
+def _tg_record_failure(ip):
+    _tg_attempts.setdefault(ip, []).append(time.time())
+
+
+def _tg_clear(ip):
+    _tg_attempts.pop(ip, None)
 _client_lock = asyncio.Lock()
 _entity_lock = asyncio.Lock()
 
@@ -108,7 +134,7 @@ _client: TelegramClient | None = None
 # 手机号和验证码哈希只在内存里留着，第一步到第二步之间要用，验证完就删，
 # 从来不写磁盘、不写日志、不进 session 文件。二次验证密码连这里都不进，
 # 只在验证那一下传给 sign_in，用完就清。
-_login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}
+_login_state: dict = {}  # 单用户：{"phone": ..., "phone_code_hash": ...}，或 {"need_password": True}
 
 
 def _clear_login_state():
@@ -205,8 +231,13 @@ async def web_login(request: Request, body: WebLoginIn):
         for k in sorted(_web_attempts.keys(), key=lambda x: min(_web_attempts[x]) if _web_attempts[x] else 0)[:500]:
             _web_attempts.pop(k, None)
     if len(_web_sessions) > 100:
+        # 先清过期的；还超就按过期时间从早到晚踢掉最旧的，只留 100 个。
+        # 以前只清过期，100 个都有效时字典就一直涨，重启前不会收敛。
         for k in list(_web_sessions.keys()):
             if _web_sessions[k] < now:
+                _web_sessions.pop(k, None)
+        if len(_web_sessions) > 100:
+            for k in sorted(_web_sessions.keys(), key=lambda x: _web_sessions[x])[:len(_web_sessions) - 100]:
                 _web_sessions.pop(k, None)
     attempts = _web_attempts.get(ip, [])
     if len(attempts) >= 5:
@@ -258,12 +289,16 @@ async def status(request: Request):
 @app.post("/api/login")
 async def login_phone(request: Request, body: PhoneIn):
     check_web_auth(request)
+    ip = _client_ip(request)
+    if _tg_rate_limited(ip):
+        raise HTTPException(status_code=429, detail="Telegram 登录尝试太多次，请 10 分钟后再试")
     client = await get_client()
     phone = body.phone.strip()
     body.phone = ""
     try:
         sent = await client.send_code_request(phone)
     except Exception as e:
+        _tg_record_failure(ip)
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
     _login_state.clear()
@@ -275,6 +310,9 @@ async def login_phone(request: Request, body: PhoneIn):
 @app.post("/api/code")
 async def login_code(request: Request, body: CodeIn):
     check_web_auth(request)
+    ip = _client_ip(request)
+    if _tg_rate_limited(ip):
+        raise HTTPException(status_code=429, detail="Telegram 登录尝试太多次，请 10 分钟后再试")
     client = await get_client()
     phone = _login_state.get("phone")
     if not phone:
@@ -285,33 +323,47 @@ async def login_code(request: Request, body: CodeIn):
         await client.sign_in(phone, code,
                              phone_code_hash=_login_state.get("phone_code_hash"))
     except SessionPasswordNeededError:
-        # 验证码已通过，手机号和哈希不再需要，二次验证那步不用它们，直接删
-        _clear_login_state()
+        # 验证码已通过，手机号和哈希不再需要，二次验证那步不用它们，直接删，
+        # 但要留一个 need_password 标记：/api/password 只认这个标记，不认直接调用。
+        _login_state.clear()
+        _login_state["need_password"] = True
         return {"ok": False, "need_password": True}
     except Exception as e:
         # 验证码不对时不删，留着让用户直接重填验证码重试，不用重新发；
         # 成功、需要二次验证、退出、重启、下一次填新手机号时都会清掉
+        _tg_record_failure(ip)
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
     # 验证码已通过，手机号和哈希用完就删
     _clear_login_state()
+    _tg_clear(ip)
     return {"ok": True, "logged_in": True}
 
 
 @app.post("/api/password")
 async def login_password(request: Request, body: PasswordIn):
     check_web_auth(request)
+    ip = _client_ip(request)
+    if _tg_rate_limited(ip):
+        raise HTTPException(status_code=429, detail="Telegram 登录尝试太多次，请 10 分钟后再试")
+    # 以前这里不校验状态：没走过验证码那一步也能直接调它试二次密码。
+    # 现在只认 /api/code 走到二次验证时留下的标记，密码错了标记还在，
+    # 可以直接重输密码重试，不用重新收验证码；成功后标记清掉。
+    if not _login_state.get("need_password"):
+        raise HTTPException(status_code=400, detail="请先填手机号和验证码，走到二次验证这一步再输密码")
     client = await get_client()
     pw = body.password
     body.password = ""
     try:
         await client.sign_in(password=pw)
     except Exception as e:
+        _tg_record_failure(ip)
         code, detail = _tg_error(e)
         raise HTTPException(status_code=code, detail=detail)
     finally:
         pw = ""
     _clear_login_state()
+    _tg_clear(ip)
     return {"ok": True, "logged_in": True}
 
 
@@ -342,6 +394,37 @@ async def logout(request: Request):
 _entity_cache: dict = {}
 _entity_cache_by_username: dict = {}
 _recently_joined: list = []
+# 实体缓存以前永不过期、只按数字 id 存：搜到后改名、退群、换号都还是旧实体，
+# _recently_joined 更是重启前一直留着。改成 30 分钟过期、最多 2000 条，
+# 最近加入的也只保留 1 小时，过期后下次走 get_entity / 对话列表重新取。
+_ENTITY_TTL = 1800
+_ENTITY_MAX = 2000
+_RECENTLY_JOINED_TTL = 3600
+_entity_cache_time: dict = {}
+_entity_cache_by_username_time: dict = {}
+_recently_joined_time: dict = {}
+
+
+def _cached_entity(eid):
+    ent = _entity_cache.get(eid)
+    if ent is None:
+        return None
+    if time.time() - _entity_cache_time.get(eid, 0) > _ENTITY_TTL:
+        _entity_cache.pop(eid, None)
+        _entity_cache_time.pop(eid, None)
+        return None
+    return ent
+
+
+def _cached_entity_by_username(uname_lower):
+    ent = _entity_cache_by_username.get(uname_lower)
+    if ent is None:
+        return None
+    if time.time() - _entity_cache_by_username_time.get(uname_lower, 0) > _ENTITY_TTL:
+        _entity_cache_by_username.pop(uname_lower, None)
+        _entity_cache_by_username_time.pop(uname_lower, None)
+        return None
+    return ent
 
 # 对话列表缓存：iter_dialogs(limit=1000) 原来在搜索、加入、我的频道、实体解析 5 处各拉一遍，
 # 加入一次可能拉 2～3 遍，又慢又容易 FloodWait。缓存 5 分钟，5 分钟内所有地方共用同一份；
@@ -378,6 +461,7 @@ def _mark_recently_joined(entity):
         return
     _recently_joined[:] = [e for e in _recently_joined if getattr(e, "id", None) != eid]
     _recently_joined.insert(0, entity)
+    _recently_joined_time[eid] = time.time()
     del _recently_joined[50:]
 
 
@@ -386,10 +470,17 @@ def _cache_entity(entity):
         return
     eid = getattr(entity, "id", None)
     if eid is not None:
+        if len(_entity_cache) >= _ENTITY_MAX and eid not in _entity_cache:
+            oldest = sorted(_entity_cache_time.items(), key=lambda kv: kv[1])[:500]
+            for k, _ in oldest:
+                _entity_cache.pop(k, None)
+                _entity_cache_time.pop(k, None)
         _entity_cache[eid] = entity
+        _entity_cache_time[eid] = time.time()
     uname = getattr(entity, "username", None)
     if uname:
         _entity_cache_by_username[uname.lower()] = entity
+        _entity_cache_by_username_time[uname.lower()] = time.time()
 def _chat_info(entity):
     # 机器人是 User 类型，不是 Channel/Chat：原来 type 一律算 chat，搜索里也分不出来。
     if isinstance(entity, Channel):
@@ -457,8 +548,10 @@ async def resolve_entity(request: Request, username: str):
     if "/+" in q or "joinchat" in q:
         raise HTTPException(status_code=400, detail="这是邀请链接，请用加入按钮加入，不要直接打开")
     norm = _normalize_username(q) or q
-    if norm.startswith("@") and norm[1:].lower() in _entity_cache_by_username:
-        return _chat_info(_entity_cache_by_username[norm[1:].lower()])
+    if norm.startswith("@"):
+        _cached = _cached_entity_by_username(norm[1:].lower())
+        if _cached is not None:
+            return _chat_info(_cached)
     try:
         entity = await client.get_entity(norm)
         _cache_entity(entity)
@@ -497,8 +590,8 @@ async def join(request: Request, body: JoinIn):
             cands.append(int(s[4:]))
         cands.append(abs(int(s)))
         for cid in cands:
-            if cid in _entity_cache:
-                entity = _entity_cache[cid]
+            entity = _cached_entity(cid)
+            if entity is not None:
                 break
             for dialog in await _get_dialogs(client):
                 if dialog.entity.id == cid:
@@ -519,8 +612,14 @@ async def join(request: Request, body: JoinIn):
     else:
         # jisou / t.me/jisou / @jisou 一律归一化成 @jisou 再解析
         arg = _normalize_username(s) or s
-        if arg.startswith("@") and arg[1:].lower() in _entity_cache_by_username:
-            entity = _entity_cache_by_username[arg[1:].lower()]
+        if arg.startswith("@"):
+            entity = _cached_entity_by_username(arg[1:].lower())
+            if entity is None:
+                try:
+                    entity = await client.get_entity(arg)
+                    _cache_entity(entity)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="找不到这个频道，请确认用户名/链接正确")
         else:
             try:
                 entity = await client.get_entity(arg)
@@ -567,6 +666,11 @@ async def my_channels(request: Request):
         if (isinstance(e, (Channel, Chat)) or is_bot) and e.id not in seen:
             seen.add(e.id)
             out.append(_chat_info(e))
+    # 最近加入的只保留 1 小时：以前是重启前一直留着，在 Telegram App 里退了群，
+    # 这里还一直顶在前面，点进去才报错。现在超时的直接从列表里清掉。
+    now = time.time()
+    _recently_joined[:] = [e for e in _recently_joined
+                           if now - _recently_joined_time.get(getattr(e, "id", None), now) <= _RECENTLY_JOINED_TTL]
     front = []
     for ent in _recently_joined:
         if ent.id not in seen:
@@ -600,17 +704,24 @@ async def _channel_entity(client, channel_id: int, username=None):
     if isinstance(channel_id, int) and channel_id < 0 and str(channel_id).startswith("-100"):
         channel_id = int(str(channel_id)[4:])
     # 先查缓存：缩略图/视频/流式播放每次都先遍历 1000 个对话会慢还容易 FloodWait
-    if channel_id in _entity_cache:
-        return _entity_cache[channel_id]
+    # 这里走带过期时间的 helper，不直接查字典，否则 30 分钟 TTL 等于没设。
+    _cached = _cached_entity(channel_id)
+    if _cached is not None:
+        return _cached
     uname = _normalize_username(username) if username else None
-    if uname and uname[1:].lower() in _entity_cache_by_username:
-        return _entity_cache_by_username[uname[1:].lower()]
+    if uname:
+        _cached = _cached_entity_by_username(uname[1:].lower())
+        if _cached is not None:
+            return _cached
     async with _entity_lock:
         # 锁里再查一次：30 张缩略图并发时，第一个遍历完缓存后，后面的直接命中，不再重复遍历
-        if channel_id in _entity_cache:
-            return _entity_cache[channel_id]
-        if uname and uname[1:].lower() in _entity_cache_by_username:
-            return _entity_cache_by_username[uname[1:].lower()]
+        _cached = _cached_entity(channel_id)
+        if _cached is not None:
+            return _cached
+        if uname:
+            _cached = _cached_entity_by_username(uname[1:].lower())
+            if _cached is not None:
+                return _cached
         for dialog in await _get_dialogs(client):
             if dialog.entity.id == channel_id:
                 return dialog.entity
@@ -1213,12 +1324,18 @@ async def _download_one_chunk(client, media, total, chunk_start, chunk_len):
     # 这样 Telethon 不用走 Generic 的“每块多下 512KB 再裁”路线，实测单连接几百 KB/s 时这点很关键。
     # 全局信号量在这里拿：4 个任务占满时，后来的窗口要等，不会无限制并发去撞 FloodWait。
     # 取完第一块必须 close 迭代器：不同 DC 时它会借一个 exported sender，不还回去会越借越多。
+    # 不要只取迭代器的第一个 yield 就返回：正常是 512KB 一块，但万一 Telethon
+    # 切成更小的片，只取第一片就会少字节，Content-Length 对不上，流就悄悄短一截。
+    # 攒满 chunk_len 才返回，不够就说明文件被改小了，调用方按空块报错处理。
     async with _download_sem:
         it = client.iter_download(media, offset=chunk_start, file_size=total)
+        buf = bytearray()
         try:
             async for chunk in it:
-                return chunk[:chunk_len]
-            return b""
+                buf.extend(chunk)
+                if len(buf) >= chunk_len:
+                    break
+            return bytes(buf[:chunk_len])
         finally:
             close = getattr(it, "close", None)
             if close is not None:
@@ -1253,8 +1370,12 @@ async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_i
     # 起点不对齐时：先从对齐起点下首块、自己裁掉前面的 skip，只浪费首块前面不到 512KB，
     # 后面所有块都是对齐的，不会像直接把不对齐起点交给 Telethon 那样每块都多下 512KB。
     # 播放中途报错有重试（只针对已经开始发的流，开始前取消息失败还是直接报 HTTP 错）：
-    # FloodWait 且 seconds <= 5：原地 sleep 这么久后重试这一块，超过 5 秒或重试 3 次还不行就报错断流；
+    # FloodWait 且 seconds <= 30：原地 sleep 这么久后重试这一块，超过 30 秒或重试 3 次还不行就报错断流；
+    # 以前是 5 秒，Telegram 动不动就给十几秒，5 秒一到就断流，播放器还以为流正常结束了。
+    # nginx 的 proxy_read_timeout 是 3600 秒，等 30 秒不会被代理先掐掉，卡一下总比直接断好。
     # FileReferenceExpired：跳过消息缓存重取一次消息，用新媒体引用重试这一块，最多重取 2 次。
+    # 空块不再悄悄 break：Content-Length 已经发出去了，空块直接结束等于告诉浏览器“流正常播完了”，
+    # 实际是少了一截；现在改成抛错断开连接，播放器会按缺失段重新发 Range 请求续上。
     # 浏览器断开/拖进度时，生成器被取消，在途任务一并取消，不会继续白下 Telegram 的流量。
     aligned_start = (start // _CHUNK) * _CHUNK
     skip = start - aligned_start
@@ -1298,7 +1419,7 @@ async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_i
                     raise
                 except FloodWaitError as e:
                     secs = getattr(e, "seconds", None)
-                    if secs is not None and secs <= 5 and flood_retries < 3:
+                    if secs is not None and secs <= 30 and flood_retries < 3:
                         flood_retries += 1
                         try:
                             await asyncio.sleep(secs)
@@ -1323,11 +1444,11 @@ async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_i
                 _issue(next_to_issue)
                 next_to_issue += 1
             if not data:
-                break
+                raise RuntimeError("Telegram 返回空数据块，流中断")
             if idx == 0 and skip:
                 data = data[skip:]
                 if not data:
-                    continue
+                    raise RuntimeError("Telegram 返回空数据块，流中断")
             if start == 0 and idx == 0 and channel_id is not None:
                 # 起点是 0 时首块就是头缓存：只有攒满 512KB（或文件本身不足 512KB）才存，
                 # 小探测不会把 2 字节的头存进去覆盖旧的

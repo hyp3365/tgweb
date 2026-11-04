@@ -90,7 +90,22 @@ check_and_issue_ssl() {
     # 指定域名
     domain=$(echo "$input_domain" | tr -d '[:space:]')
     if [[ -z "$domain" ]]; then red "域名不能为空！"; return 1; fi
-    if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then red "IP 不用走域名工具，直接用 IP 访问。"; return 1; fi
+    # IP 也能绑：install.sh 本来就承诺“域名或 IP”，证书放在 /root/cert/<IP>/ 或
+    # /etc/nginx/cert/<IP>/ 里。以前这里直接拒绝 IP，install 走到这一步必定失败，
+    # 而仓库里也没有别的 IP 配置生成器，IP 用户就卡住了。IP 没有泛域名/父域名那一套，
+    # 只认它自己的证书目录，找不到就明说失败。
+    if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ -f "/root/cert/${domain}/fullchain.pem" && -f "/root/cert/${domain}/privkey.pem" ]]; then
+            cert_file="/root/cert/${domain}/fullchain.pem"; key_file="/root/cert/${domain}/privkey.pem"
+        elif [[ -f "/etc/nginx/cert/${domain}/fullchain.pem" && -f "/etc/nginx/cert/${domain}/privkey.pem" ]]; then
+            cert_file="/etc/nginx/cert/${domain}/fullchain.pem"; key_file="/etc/nginx/cert/${domain}/privkey.pem"
+        else
+            red "未找到 IP ${domain} 的证书，请先把证书放到 /root/cert/${domain}/ 或 /etc/nginx/cert/${domain}/ 里。"
+            return 1
+        fi
+        skyblue "检测到 IP ${domain} 的证书已存在，直接使用。"
+        return 0
+    fi
     local domain_re='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
     if ! [[ "$domain" =~ $domain_re ]]; then red "域名格式不对，例如 example.com"; return 1; fi
 
@@ -149,11 +164,25 @@ check_and_issue_ssl() {
 }
 
 reload_or_rollback() {   # $1 = 备份文件（空 = 原来没有配置）
+    # 以前这里只看 nginx -t，systemctl reload 失败也照样 return 0 还删备份：
+    # 用户看到“已设置”，实际 nginx 还在跑旧配置。改成重载失败也算失败。
     local out
-    if out=$(nginx -t 2>&1); then systemctl reload nginx; rm -f "$1"; return 0; fi
+    if ! out=$(nginx -t 2>&1); then
+        if [[ -n "$1" ]]; then mv "$1" "$CONF"; else rm -f "$CONF"; fi
+        red "Nginx 配置检查没通过，已恢复原来的配置："
+        echo "$out" | sed 's/^/  /'
+        return 1
+    fi
+    # 重载按顺序试：systemd 方式不行就试 nginx -s reload（非 systemd 运行的 nginx），
+    # nginx 根本没跑就试启动。哪一步成了才删备份、算成功。
+    if systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || systemctl start nginx 2>/dev/null || nginx 2>/dev/null; then
+        [[ -n "$1" ]] && rm -f "$1"
+        return 0
+    fi
     if [[ -n "$1" ]]; then mv "$1" "$CONF"; else rm -f "$CONF"; fi
-    red "Nginx 配置检查没通过，已恢复原来的配置："
-    echo "$out" | sed 's/^/  /'
+    systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+    red "Nginx 配置已写入且检查通过，但重载/启动失败，已恢复原来的配置。"
+    red "请手动跑 systemctl reload nginx 或 nginx -s reload，成功后再重新绑定。"
     return 1
 }
 
@@ -178,16 +207,31 @@ if [[ -n "$other" ]]; then
     echo "$other" | sed 's/^/  /'
 fi
 
+# http2 写法按 nginx 版本分：http2 on 是 1.25.1 才有的指令，apt 默认的
+# Debian 12（1.22）/ Ubuntu 24.04（1.24）上写它，nginx -t 直接失败，绑定就回滚；
+# listen ... http2 在老版本上能用，在新版本上只是提示 deprecated，还能跑。
+# 所以老版本用 listen 参数，新版本用 http2 on，两边都不报错。
+_NGINX_VER="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -n "$_NGINX_VER" ] && [ "$(printf '%s\n%s\n' "1.25.1" "$_NGINX_VER" | sort -V | head -1)" = "1.25.1" ]; then
+    _LISTEN443="listen 443 ssl;"
+    _LISTEN443V6="listen [::]:443 ssl;"
+    _HTTP2_LINE="    http2 on;"
+else
+    _LISTEN443="listen 443 ssl http2;"
+    _LISTEN443V6="listen [::]:443 ssl http2;"
+    _HTTP2_LINE=""
+fi
+
 # 旧的 HTTP 反代必须删掉，否则绑了 HTTPS 也能用 HTTP 明文进应用
 rm -f /etc/nginx/conf.d/tgweb.conf
 cat > "$CONF" <<EOF
 # tgweb 域名（由 tg domain 生成；再运行 tg domain 可换域名）
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    ${_LISTEN443}
+    ${_LISTEN443V6}
     server_name ${domain};
     server_tokens off;
-    http2 on;
+${_HTTP2_LINE}
     gzip on;
     gzip_proxied any;
     gzip_types application/json text/css application/javascript;
