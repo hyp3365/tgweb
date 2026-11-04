@@ -1576,4 +1576,11 @@ async def stream(request: Request, channel_id: int, msg_id: int, username: str |
 
 @app.get("/")
 async def index():
-    return FileResponse("index.html")
+    # 首页是经常改的前端代码，绝不能让手机浏览器缓存旧版：
+    # 旧版里 t.me 链接会跳到 t.me、进而跳到 Telegram App，新版是在网页里提示加入。
+    # 之前就有用户更新了服务器、手机还用旧页面，导致链接仍跳 App 的情况。
+    return FileResponse("index.html", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
