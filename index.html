@@ -107,15 +107,19 @@ a.kb-btn{display:block}
 /* 单手用手机时：播放器沉到底部附近，进度条就在拇指附近，不用够到屏幕中间去拖。
    只在触屏或窄屏上这样，电脑鼠标能轻松点中间，电脑上还是居中，不会变得很怪。
    底部 64px 的空还是给关闭按钮留的，进度条不会被按钮压住。
-   注意：这里千万不能再用 translateY(-50%) 把框往上抬半个框高——那就是竖屏视频
-   上半被遮住的 bug：框是 flex-end 贴底的，再往上抬半个框高，横屏视频框矮还看不出来，
-   竖屏视频框高约 80vh，抬半个框就是约 40vh，视频上半约一半直接顶出屏幕上面。
-   现在就是贴底不动：竖屏视频高、进度条本来就在底部附近，拇指照样够得到，
+   横屏和竖屏不能用同一种位置：横屏视频框矮，原来往上抬半个框高（translateY(-50% - 62px)）
+   正好落在屏幕下半段中间，改成贴底不动就嫌太下面了，所以横屏保持原来那样。
+   竖屏视频框高约 80vh，再抬半个框就是约 40vh，上半约一半直接顶出屏幕上面，
+   所以竖屏才贴底不动：竖屏视频高、进度条本来就在底部附近，拇指照样够得到，
    而且框高（视频 80vh + 进度条约 52px）小于贴底可用高度（100vh - 64px 底边距），
-   只要手机高超过 600px 就不会超屏，正常手机都满足。 */
+   只要手机高超过 600px 就不会超屏，正常手机都满足。
+   横竖屏不是看手机方向，而是看视频本身尺寸：JS 在 loadedmetadata 时按
+   videoHeight > videoWidth 给框加 portrait-video 类，竖屏才走贴底那条，
+   横屏和正方形都不加，还是原来抬半框的位置。 */
 @media (pointer: coarse) and (orientation: portrait), (max-width: 768px) and (orientation: portrait) {
   .modal{align-items:flex-end}
-  .modal-box{transform:none}
+  .modal-box{transform:translateY(calc(-50% - 62px))}
+  .modal-box.portrait-video{transform:none}
 }
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
@@ -685,6 +689,7 @@ function seekPlayerFromEvent(e){
 function closePlayer(){
   const p = document.getElementById('player');
   p.pause(); p.removeAttribute('src'); p.load();
+  document.querySelector('#playerModal .modal-box').classList.remove('portrait-video');
   document.getElementById('playerModal').classList.add('hidden');
   document.body.style.overflow = '';
   playerDragging = false;
@@ -1259,9 +1264,21 @@ function playVideo(channelId, msgId){
   document.getElementById('playerModal').classList.remove('hidden');
   document.body.style.overflow = 'hidden';
   playerDragging = false;
+  // 先清掉上一个视频的竖屏标记：新视频尺寸还没出来之前，默认按横屏位置放，
+  // 等下面 loadedmetadata 判出尺寸再决定要不要贴底，不会把上一个竖屏的位置带过来。
+  document.querySelector('#playerModal .modal-box').classList.remove('portrait-video');
   p.src = `${WEB_BASE}/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
   updatePlayerProgress();
 }
+// 播放时先判断视频尺寸：元数据一到就看 videoHeight 和 videoWidth，
+// 高大于宽就是竖屏，给框加 portrait-video 类走贴底不动；横屏和正方形不加，
+// 保持原来往上抬半框的位置。元数据没到之前不判，默认横屏位置，不会闪一下贴底。
+document.getElementById('player').addEventListener('loadedmetadata', ()=>{
+  const p = document.getElementById('player');
+  const box = document.querySelector('#playerModal .modal-box');
+  if (!box || !p.videoWidth || !p.videoHeight) return;
+  box.classList.toggle('portrait-video', p.videoHeight > p.videoWidth);
+});
 document.getElementById('searchResults').addEventListener('click', e=>{
   if (!document.getElementById('channelDeleteModal').classList.contains('hidden')) return;
   const btn = e.target.closest('button');
