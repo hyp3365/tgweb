@@ -37,7 +37,7 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 #loginView .login-box{margin:40px auto}
 .login-step-title{font-size:18px;font-weight:700;margin:0 0 16px;text-align:center}
 .channels-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.channel-card{border:1px solid #222;border-radius:12px;padding:14px;cursor:pointer;background:#0d0d0d;user-select:none;-webkit-user-select:none}
+.channel-card{border:1px solid #222;border-radius:12px;padding:14px;cursor:pointer;background:#0d0d0d;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
 .channel-card:hover{border-color:#555;background:#141414}
 .channel-row{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .channel-row .channel-info{min-width:0}
@@ -1284,8 +1284,10 @@ document.getElementById('channels').addEventListener('click', e=>{
   navStack = [];
   loadChat(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '');
 });
-// 长按检测：pointer 事件同时覆盖触屏和鼠标按住。600 毫秒到了就弹删除框，
-// 松手、取消、手指滑动超过 10 像素都算没按住，直接取消计时，正常滑动列表不会误弹。
+// 长按检测：pointer 事件同时覆盖触屏和鼠标按住。500 毫秒到了就弹删除框，
+// 松手、取消、手指滑动超过 20 像素都算没按住，直接取消计时，正常滑动列表不会误弹。
+// 500 毫秒而不是 600 毫秒：手机浏览器长按到一定时间会自己弹系统菜单并取消 pointer，
+// 计时太长就永远等不到弹框；阈值放宽到 20 像素是手指按住时轻微抖动也不会误取消。
 let longPressTimer = null;
 let longPressStartX = 0;
 let longPressStartY = 0;
@@ -1304,18 +1306,25 @@ channelsEl.addEventListener('pointerdown', e=>{
     longPressTimer = null;
     suppressChannelClick = true;
     showChannelDelete(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '', card.dataset.type || 'channel');
-  }, 600);
+  }, 500);
 });
 channelsEl.addEventListener('pointerup', cancelLongPress);
 channelsEl.addEventListener('pointercancel', cancelLongPress);
 channelsEl.addEventListener('pointerleave', cancelLongPress);
 channelsEl.addEventListener('pointermove', e=>{
   if (!longPressTimer) return;
-  if (Math.abs(e.clientX - longPressStartX) > 10 || Math.abs(e.clientY - longPressStartY) > 10) cancelLongPress();
+  if (Math.abs(e.clientX - longPressStartX) > 20 || Math.abs(e.clientY - longPressStartY) > 20) cancelLongPress();
 });
-// 手机长按本来会弹出系统菜单/选词，卡片上直接禁掉，避免系统菜单盖住删除框。
+// 手机长按本来会弹出系统菜单/选词，而且有的浏览器在弹系统菜单时会直接取消 pointer，
+// 导致上面 500 毫秒的计时永远跑不到。所以系统菜单事件本身也当作长按处理：
+// 禁掉系统菜单，直接弹我们的删除框。电脑上右键卡片也会弹这个框，同样能删。
+// 注意：弹框在 #channels 外面，后面松手产生的 click 不会落到卡片上，不用再设 suppress。
 channelsEl.addEventListener('contextmenu', e=>{
-  if (e.target.closest('.channel-card')) e.preventDefault();
+  const card = e.target.closest('.channel-card');
+  if (!card) return;
+  e.preventDefault();
+  cancelLongPress();
+  showChannelDelete(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '', card.dataset.type || 'channel');
 });
 refreshStatus();
 </script></body></html>
