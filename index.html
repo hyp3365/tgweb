@@ -5,6 +5,7 @@
 <style>
 *{box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:#000;color:#e8e8e8;margin:0;line-height:1.6}
+html,body{overscroll-behavior-x:none;overscroll-behavior:none}
 .wrap{max-width:1000px;margin:0 auto;padding:0 16px 40px}
 section{background:#0d0d0d;border:1px solid #222;border-radius:14px;padding:16px;margin:16px 0}
 h2{font-size:18px;margin:0 0 12px;font-weight:700}
@@ -474,11 +475,59 @@ window.addEventListener('popstate', (e)=>{
     if (!isNonRoot) tgwebPushState();
   }
 });
-// 进来就先占一个历史条目：不然用户在根页面（所有频道/登录页）一滑，
+// 进来就先占几个历史条目：不然用户在根页面（所有频道/登录页）一滑，
   // 浏览器直接就出网页了，popstate 根本没机会跑、补推也来不及。
-  // 有了这一条，根页面一滑是弹回最初那条，上面 popstate 的全局防退出
-  // 再补推一条，永远在 tgweb 里打转，只能手动关标签页。
-tgwebPushState();
+  // 有了这几条，根页面一滑是弹回上一条 tgweb，上面 popstate 的全局
+  // 防退出再补推一条，永远在 tgweb 里打转，只能手动关标签页。
+  // 一次推 3 条不是多余：手机上快速连滑、或者个别浏览器在 popstate
+  // 里补推被忽略时，栈里还有缓冲条目，不会一次就滑出网页。
+tgwebPushState(); tgwebPushState(); tgwebPushState();
+// 第二层防退出：屏幕边缘滑动手势。只靠历史补推还不够，因为有的手机
+// 浏览器/应用内浏览器（Telegram、微信内嵌网页、PWA、系统返回手势）
+// 的边缘滑动是系统级手势，根本不走页面的 popstate，或者在 popstate
+// 里补推会被忽略，历史一空就直接关网页。所以再在页面层拦截一次：
+// 手指从屏幕最左 28px 内起手、向右横滑超过 30px 且横向大于纵向时，
+// 就用 preventDefault 挡住浏览器接管，松手时横滑超过 60px 才算一次
+// 边缘返回。根页面（所有频道/登录）就什么都不做、只挡住浏览器，
+// 永远不出网页；聊天/视频/评论页就走 history.back()，让 popstate
+// 去回上一页，和返回按钮同一条路，不会一次滑两页。
+// 播放器弹窗、删除框、输入框里不拦截：播放器里横滑是快进快退，
+// 删除框和输入框有自己的操作，边缘滑动留给历史那一层处理。
+let edgeSwipeStartX = 0, edgeSwipeStartY = 0, edgeSwipeActive = false, edgeSwipeTracking = false;
+function edgeSwipeExcluded(target){
+  if (!target || !target.closest) return false;
+  if (target.closest('#playerModal') || target.closest('#channelDeleteModal')) return true;
+  if (target.closest('input,textarea,select')) return true;
+  return false;
+}
+function edgeSwipeBack(){
+  if (!document.getElementById('commentsView').classList.contains('hidden')) { backFromComments(); return; }
+  if (!document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden')) { backToChannels(); return; }
+  // 根页面：什么都不做，就是不退出网页。
+}
+document.addEventListener('touchstart', e=>{
+  const t = e.touches && e.touches[0]; if (!t) return;
+  if (t.clientX > 28 || edgeSwipeExcluded(e.target)) { edgeSwipeTracking = false; edgeSwipeActive = false; return; }
+  edgeSwipeStartX = t.clientX; edgeSwipeStartY = t.clientY; edgeSwipeTracking = true; edgeSwipeActive = false;
+}, {passive:true});
+document.addEventListener('touchmove', e=>{
+  const t = e.touches && e.touches[0]; if (!t || !edgeSwipeTracking) return;
+  // 起手在边缘但还没成型横滑的不挡，正常竖滑滚动不受影响。
+  const dx = t.clientX - edgeSwipeStartX, dy = t.clientY - edgeSwipeStartY;
+  if (dx <= 0) return;
+  if (Math.abs(dx) > 30 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    edgeSwipeActive = true;
+    e.preventDefault();
+  }
+}, {passive:false});
+document.addEventListener('touchend', e=>{
+  if (!edgeSwipeActive) { edgeSwipeTracking = false; return; }
+  const t = e.changedTouches && e.changedTouches[0];
+  const dx = t ? (t.clientX - edgeSwipeStartX) : 0;
+  edgeSwipeActive = false; edgeSwipeTracking = false;
+  if (dx >= 60) edgeSwipeBack();
+}, {passive:true});
+document.addEventListener('touchcancel', ()=>{ edgeSwipeActive = false; edgeSwipeTracking = false; }, {passive:true});
 async function openChannelLink(username, msgId){
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
