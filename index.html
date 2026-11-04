@@ -530,7 +530,7 @@ function renderSearchPage(){
   const hasNext = start + SEARCH_PAGE_SIZE < searchResultsCache.length;
   const hasPrev = searchPage > 0;
   box.innerHTML = `<div style="text-align:right;margin-bottom:6px"><button data-action="close" style="padding:4px 10px;font-size:13px">× 关闭</button></div>` + page.map(r=>
-    `<div class="item search-item" data-id="${r.id}" data-title="${esc(r.title)}" data-username="${esc(r.username||'')}"><b>${linkify(esc(r.title))}</b> ${r.username?`<span class="chat-link">@${esc(r.username)}</span>`:''} <span class="muted">${esc(r.type)}</span><br>
+    `<div class="item search-item" data-id="${r.id}" data-title="${esc(r.title)}" data-username="${esc(r.username||'')}" data-type="${esc(r.type||'channel')}"><b>${linkify(esc(r.title))}</b> ${r.username?`<span class="chat-link">@${esc(r.username)}</span>`:''} <span class="muted">${esc(r.type)}</span><br>
      <button data-action="join" data-ch="${esc(r.username||r.id)}">加入</button>
      <button data-action="chat">聊天</button>
      <button data-action="video">视频</button></div>`).join('')
@@ -574,6 +574,7 @@ let channelDeleteTarget = null;
 function channelDeleteKind(type){
   if (type === 'bot') return {name: '机器人', verb: '删除机器人', hint: '删除后将清除与该机器人的对话，之后可以重新开始对话。'};
   if (type === 'chat') return {name: '群组', verb: '删除群组', hint: '删除后将退出该群组，私密群组退出后没有邀请链接就回不来了，请确认。'};
+  if (type === 'private') return {name: '私聊', verb: '删除私聊', hint: '删除后将清除自己这边的对话记录，对方那边不受影响，之后可以重新开始对话。'};
   return {name: '频道', verb: '删除频道', hint: '删除后将退出该频道，私密频道退出后没有邀请链接就回不来了，请确认。'};
 }
 function showChannelDelete(id, title, username, type){
@@ -597,6 +598,11 @@ async function confirmChannelDelete(){
     await api('/api/leave',{method:'POST', body:JSON.stringify({channel_id: target.id, username: target.username || null})});
     hideChannelDelete();
     alert('已删除：' + (target.title || ('#' + target.id)));
+    // 从搜索结果里删的也要从搜索列表里去掉，不能只刷全部频道，不然搜出来的那条还留着。
+    if (typeof searchResultsCache !== 'undefined' && searchResultsCache.length) {
+      searchResultsCache = searchResultsCache.filter(r => r.id !== target.id);
+      if (searchResultsCache.length) renderSearchPage(); else hideSearchResults();
+    }
     loadChannels();
   }catch(e){
     alert(e.message);
@@ -1258,6 +1264,7 @@ function playVideo(channelId, msgId){
   updatePlayerProgress();
 }
 document.getElementById('searchResults').addEventListener('click', e=>{
+  if (!document.getElementById('channelDeleteModal').classList.contains('hidden')) return;
   const btn = e.target.closest('button');
   if (btn && btn.dataset.action === 'close') { hideSearchResults(); return; }
   const item = e.target.closest('.search-item');
@@ -1324,6 +1331,43 @@ channelsEl.addEventListener('contextmenu', e=>{
   e.preventDefault();
   cancelLongPress();
   showChannelDelete(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '', card.dataset.type || 'channel');
+});
+// 搜索结果长按也能删：私聊不在全部频道列表里，搜出来才是删私聊的入口，
+// 所以搜索结果也用同一套长按逻辑。按在加入/聊天/视频按钮上不算长按，
+// 不然按住加入按钮也会弹删除框；只按在条目本身（标题那行）才弹。
+const searchEl = document.getElementById('searchResults');
+let searchLongPressTimer = null;
+let searchLongPressStartX = 0;
+let searchLongPressStartY = 0;
+function cancelSearchLongPress(){
+  if (searchLongPressTimer) { clearTimeout(searchLongPressTimer); searchLongPressTimer = null; }
+}
+searchEl.addEventListener('pointerdown', e=>{
+  if (e.target.closest('button')) return;
+  const item = e.target.closest('.search-item');
+  if (!item) return;
+  cancelSearchLongPress();
+  searchLongPressStartX = e.clientX;
+  searchLongPressStartY = e.clientY;
+  searchLongPressTimer = setTimeout(()=>{
+    searchLongPressTimer = null;
+    showChannelDelete(Number(item.dataset.id), item.dataset.title || '', item.dataset.username || '', item.dataset.type || 'channel');
+  }, 500);
+});
+searchEl.addEventListener('pointerup', cancelSearchLongPress);
+searchEl.addEventListener('pointercancel', cancelSearchLongPress);
+searchEl.addEventListener('pointerleave', cancelSearchLongPress);
+searchEl.addEventListener('pointermove', e=>{
+  if (!searchLongPressTimer) return;
+  if (Math.abs(e.clientX - searchLongPressStartX) > 20 || Math.abs(e.clientY - searchLongPressStartY) > 20) cancelSearchLongPress();
+});
+searchEl.addEventListener('contextmenu', e=>{
+  if (e.target.closest('button')) return;
+  const item = e.target.closest('.search-item');
+  if (!item) return;
+  e.preventDefault();
+  cancelSearchLongPress();
+  showChannelDelete(Number(item.dataset.id), item.dataset.title || '', item.dataset.username || '', item.dataset.type || 'channel');
 });
 refreshStatus();
 </script></body></html>

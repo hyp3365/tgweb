@@ -491,6 +491,10 @@ def _chat_info(entity):
         typ = "channel"
     elif isinstance(entity, User) and getattr(entity, "bot", False):
         typ = "bot"
+    elif isinstance(entity, User):
+        # 私聊：原来一律算 chat，搜索结果里会显示成群组，删除提示也会写错。
+        # 现在单独算 private，删除时文案写“私聊”才对。
+        typ = "private"
     else:
         typ = "chat"
     return {"id": getattr(entity, "id", None),
@@ -667,10 +671,9 @@ async def leave_channel(request: Request, body: LeaveIn):
     check_web_auth(request)
     client = await require_login()
     entity = await _channel_entity(client, body.channel_id, body.username)
-    # 只给删全部频道列表里会出现的东西：频道、群组、机器人。私聊 User 不在列表里，
-    # 但接口本身没拦的话，拼一个私聊 id 就能把私聊记录清掉，这里直接拒绝。
-    if isinstance(entity, User) and not getattr(entity, "bot", False):
-        raise HTTPException(status_code=400, detail="只能删除频道、群组或机器人，私聊不在删除范围")
+    # 私聊也要能删：上一版这里拦了私聊 User，现在按用户要求放开。
+    # Telethon 的 delete_dialog 对 User 就是清对话记录（只清自己这边，revoke 默认关），
+    # 不会动对方那边的记录，频道/群组/机器人还是原来的退出/清对话。
     info = _chat_info(entity)
     try:
         await client.delete_dialog(entity)
