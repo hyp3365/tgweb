@@ -102,7 +102,7 @@ a.kb-btn{display:block}
    双击按钮本身还是被双击处理排除的，不会触发快进。
    弹窗底部内边距留 64px 给这个按钮（按钮高约 35px + 离底边 16px + 空隙），
    这样播放器框底边和按钮之间总有空隙，按钮不会压住进度条的时间文字。 */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px;touch-action:none}
 .modal-box{width:100%;max-width:1600px;position:relative}
 /* 单手用手机时：播放器沉到底部附近，进度条就在拇指附近，不用够到屏幕中间去拖。
    只在触屏或窄屏上这样，电脑鼠标能轻松点中间，电脑上还是居中，不会变得很怪。
@@ -123,7 +123,7 @@ a.kb-btn{display:block}
 }
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
-.modal-box video{width:100%;max-height:80vh;max-height:80dvh;background:#000;border-radius:12px;touch-action:pan-y}
+.modal-box video{width:100%;max-height:80vh;max-height:80dvh;background:#000;border-radius:12px;touch-action:none}
 .modal-close{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:101;margin:0;padding:7px 14px;font-size:14px}
 /* 原生进度条去掉：浏览器自带的 controls 是一整套，没法只关其中一条，
    只能用 WebKit 的伪元素把时间轴藏起来，播放/音量/全屏这些按钮还在。
@@ -729,11 +729,19 @@ document.getElementById('playerModal').addEventListener('dblclick', e=>{
   p.currentTime = nt;
   showSeekFeedback(dir);
 });
-// 滑动快进快退：视频上左右滑，松手才跳，不是一边滑一边跳。
-// 幅度按滑过的横向距离占屏幕宽的比例算：滑满一屏宽 = 6 分钟，
-// 再大也封顶 6 分钟；只要算成滑动（横向超过 24px 且横向大于纵向），
-// 哪怕滑得短也至少跳 30 秒，不会出现“滑了半天只跳 2 秒”的情况。
-// 方向：向右快进，向左快退；竖着滑不算，防止上下滑动时误跳。
+// 滑动快进快退，改成和双击同款：监听挂在整个播放器弹窗上，不是只挂视频上，
+// 所以视频框外面的黑边上滑也有效；双击是按屏幕中间分左右，滑动是按滑的方向和距离算。
+// 上一版只靠 pointermove 在视频上拖动时没效果：手机浏览器在视频上拖动时会直接
+// 把 pointer 取消掉（pointercancel），move 根本没跑到，松手时 swipeActive 还是假的，
+// 所以一次都没跳。这版改成三处兜底：
+// 1) pointer 和 touch 两套事件都接，touchmove 用非被动监听，横滑时 preventDefault
+//    挡住浏览器接管手势，这样 move 不会被取消；
+// 2) 松手/取消时都用终点位置再算一次：哪怕中间 move 一次都没来，只要起点到终点
+//    横向超过 24px 且横向大于纵向，就算一次滑动，快 flick 一下也有效；
+// 3) pointercancel 不再直接丢弃：浏览器取消时手势已经滑出去了，终点距离够就照样跳，
+//    只有距离不够或竖滑才不跳。
+// 幅度还是按滑过的横向距离占屏幕宽的比例算：滑满一屏宽 = 6 分钟，封顶 6 分钟；
+// 只要算成滑动，哪怕滑得短也至少跳 30 秒。向右快进，向左快退，竖着滑不算。
 // 不抢已有的操作：起点在常显进度条、关闭按钮、视频底部 48px 原生控制条上
 // 的，一律不启动滑动，进度条拖动和原生播放/音量/全屏照常；双击快进快退还在。
 let swipeStartX = 0, swipeStartY = 0, swipeStartTime = 0, swipeActive = false, swipeDelta = 0;
@@ -750,19 +758,22 @@ function fmtSwipe(sec){
   const s = Math.round(Math.abs(sec));
   return s >= 60 ? Math.floor(s / 60) + '分' + String(s % 60).padStart(2, '0') + '秒' : s + '秒';
 }
-const playerModalEl = document.getElementById('playerModal');
-playerModalEl.addEventListener('pointerdown', e=>{
-  if (e.target.closest && (e.target.closest('#playerProgress') || e.target.closest('.modal-close'))) return;
+function swipeExcluded(target, x, y){
+  if (target && target.closest && (target.closest('#playerProgress') || target.closest('.modal-close'))) return true;
   const p = document.getElementById('player');
   const r = p.getBoundingClientRect();
-  if (r.width && e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom && e.clientY > r.bottom - 48) return;
-  swipeStartX = e.clientX; swipeStartY = e.clientY;
+  return !!(r.width && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && y > r.bottom - 48);
+}
+function swipeStart(x, y, target){
+  if (swipeExcluded(target, x, y)) return;
+  const p = document.getElementById('player');
+  swipeStartX = x; swipeStartY = y;
   swipeStartTime = p.currentTime || 0;
   swipeActive = false; swipeDelta = 0; swipeTracking = true;
-});
-playerModalEl.addEventListener('pointermove', e=>{
+}
+function swipeMove(x, y){
   if (!swipeTracking) return;
-  const dx = e.clientX - swipeStartX, dy = e.clientY - swipeStartY;
+  const dx = x - swipeStartX, dy = y - swipeStartY;
   if (!swipeActive) {
     if (Math.abs(dx) <= 24 || Math.abs(dx) <= Math.abs(dy)) return;
     swipeActive = true;
@@ -778,15 +789,23 @@ playerModalEl.addEventListener('pointermove', e=>{
     f.style.left = '50%';
     f.classList.add('show');
   }
-});
-function endSwipe(apply){
+}
+function endSwipe(endX, endY){
   const f = document.getElementById('seekFeedback');
-  if (swipeActive && apply) {
+  // 终点再算一次：move 没来过、或者被浏览器取消过，只要终点距离够都算滑动。
+  if (swipeTracking && endX !== undefined && endY !== undefined) {
+    const dx = endX - swipeStartX, dy = endY - swipeStartY;
+    if (!swipeActive && Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy)) {
+      swipeActive = true;
+      swipeDelta = swipeSeekDelta(dx);
+    }
+  }
+  if (swipeActive) {
     const p = document.getElementById('player');
-    if (isFinite(p.duration) || !isNaN(p.duration)) {
+    if (isFinite(p.duration)) {
       let target = swipeStartTime + swipeDelta;
       if (target < 0) target = 0;
-      if (isFinite(p.duration) && target > p.duration) target = p.duration;
+      if (target > p.duration) target = p.duration;
       p.currentTime = target;
       // 滑完松手浏览器还会补一个 click，点在视频上会误触发播放/暂停，
       // 400ms 内的这个 click 直接拦掉，见下面 capture 的 click 监听。
@@ -796,8 +815,31 @@ function endSwipe(apply){
   if (f) { f.classList.remove('show'); clearTimeout(seekFeedbackTimer); }
   swipeActive = false; swipeDelta = 0; swipeTracking = false; swipeStartX = 0; swipeStartY = 0;
 }
-playerModalEl.addEventListener('pointerup', ()=>endSwipe(true));
-playerModalEl.addEventListener('pointercancel', ()=>endSwipe(false));
+const playerModalEl = document.getElementById('playerModal');
+playerModalEl.addEventListener('pointerdown', e=>swipeStart(e.clientX, e.clientY, e.target));
+playerModalEl.addEventListener('pointermove', e=>swipeMove(e.clientX, e.clientY));
+playerModalEl.addEventListener('pointerup', e=>endSwipe(e.clientX, e.clientY));
+playerModalEl.addEventListener('pointercancel', e=>endSwipe(e.clientX, e.clientY));
+playerModalEl.addEventListener('touchstart', e=>{
+  const t = e.touches[0]; if (t) swipeStart(t.clientX, t.clientY, e.target);
+}, {passive: true});
+playerModalEl.addEventListener('touchmove', e=>{
+  const t = e.touches[0]; if (!t) return;
+  // 横滑一旦成型就挡住浏览器默认手势，不然浏览器一接管就发 cancel，滑动又没了。
+  if (swipeTracking) {
+    const dx = t.clientX - swipeStartX, dy = t.clientY - swipeStartY;
+    if (Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy)) e.preventDefault();
+  }
+  swipeMove(t.clientX, t.clientY);
+}, {passive: false});
+playerModalEl.addEventListener('touchend', e=>{
+  const t = e.changedTouches[0];
+  endSwipe(t ? t.clientX : undefined, t ? t.clientY : undefined);
+});
+playerModalEl.addEventListener('touchcancel', e=>{
+  const t = e.changedTouches[0];
+  endSwipe(t ? t.clientX : undefined, t ? t.clientY : undefined);
+});
 playerModalEl.addEventListener('click', e=>{
   if (Date.now() - swipeEndAt < 400) { e.preventDefault(); e.stopPropagation(); }
 }, true);
