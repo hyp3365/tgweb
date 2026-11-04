@@ -448,9 +448,10 @@ window.addEventListener('popstate', (e)=>{
   }
   if (deleteOpen) {
     // 删除框没有自己的历史条目，还是老办法：先关框、再把历史深度补回去，
-    // 这样这次返回只关框，下一次返回才回上一页。
+    // 这样这次返回只关框，下一次返回才回上一页。补推同样要延迟，
+    // 不然 Chrome 上在 popstate 里直接推会被忽略。
     hideChannelDelete();
-    tgwebPushState();
+    if (typeof tgwebTrapLater === 'function') tgwebTrapLater(); else tgwebPushState();
     return;
   }
   tgwebSeq = (e.state && e.state.tgweb) ? (e.state.seq || 0) : 0;
@@ -466,14 +467,35 @@ window.addEventListener('popstate', (e)=>{
   // 全局防退出：不管在哪个页面，滑动返回（浏览器返回）都不能关闭网页，
   // 只能手动关闭网页（关标签页/关浏览器）。非根页面上面已经回了上一页，
   // 栈里还有 tgweb 条目，不会退出；只有回到根页面、且栈顶已经是最初
-  // 那条（seq==0）时，下一次返回就会真的离开，所以这里立刻再补推一
-  // 条根条目，栈永远保持“最初 + 一条 tgweb”，下一次返回又弹回最初、
-  // 又补推，永远出不去。注意这段在 finally 之后跑，tgwebPopping 已
-  // 经复位，push 才不会被挡住。
+  // 那条（seq==0）时，下一次返回就会真的离开，所以这里要再补推根条目，
+  // 栈永远保持“最初 + tgweb 条目”，下一次返回又弹回最初、又补推，
+  // 永远出不去。注意补推不能在 popstate 里同步做：Chrome 上滑动返回
+  // 时在 popstate 里直接 pushState 经常被忽略（这就是“先进来滑 3 次
+  // 才退出”的原因——3 条缓冲被滑空，补推没生效），所以改成延迟到
+  // popstate 跑完之后再推，浏览器已经完成这次返回，push 才能生效。
   if (tgwebSeq === 0) {
     const isNonRoot = !document.getElementById('commentsView').classList.contains('hidden') || !document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden');
-    if (!isNonRoot) tgwebPushState();
+    if (!isNonRoot) tgwebTrapLater();
   }
+});
+// 延迟补推：popstate 里直接推在 Chrome 上会被忽略，setTimeout 0
+// 让浏览器先完成这次返回再推，下一次滑动前一定已经推好了。
+// 一次推 3 条做缓冲，快速连滑也不会一次滑空。
+let tgwebTrapTimer = null;
+function tgwebTrapLater(){
+  if (tgwebTrapTimer) return;
+  tgwebTrapTimer = setTimeout(()=>{
+    tgwebTrapTimer = null;
+    tgwebPushState(); tgwebPushState(); tgwebPushState();
+  }, 0);
+}
+// 返回缓存恢复：用户从 tgweb 滑出到上一个网站，再用浏览器前进
+// 回到 tgweb 时，页面是从返回缓存（bfcache）恢复的，脚本不会重跑，
+// 进来时占的那 3 条缓冲已经没了，栈顶就是最初那条，再滑一次就
+// 直接退出——这就是“再次进入滑动一次就能退出”的原因。pageshow
+// 里 persisted 为真就是这种情况，重新补推缓冲条目。
+window.addEventListener('pageshow', e=>{
+  if (e && e.persisted) tgwebTrapLater();
 });
 // 进来就先占几个历史条目：不然用户在根页面（所有频道/登录页）一滑，
   // 浏览器直接就出网页了，popstate 根本没机会跑、补推也来不及。
