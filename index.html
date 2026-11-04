@@ -297,7 +297,7 @@ a.kb-btn{display:block}
     </div>
     <div id="seekFeedback" class="seek-feedback"></div>
   </div>
-  <button class="modal-close" onclick="closePlayer()">× 关闭</button>
+  <button class="modal-close" onclick="closePlayerViaBack()">× 关闭</button>
 </div>
 
 <!-- 全部频道长按弹出的删除确认：只在全部频道列表里长按才出现，点开频道后不出现。
@@ -435,10 +435,20 @@ function tgwebPushState(){
 window.addEventListener('popstate', (e)=>{
   const playerOpen = !document.getElementById('playerModal').classList.contains('hidden');
   const deleteOpen = !document.getElementById('channelDeleteModal').classList.contains('hidden');
-  if (playerOpen || deleteOpen) {
-    // 弹窗先关，历史深度补回去：下一次返回才回上一页，这次不回上一页。
-    if (playerOpen) closePlayer();
-    if (deleteOpen) hideChannelDelete();
+  if (playerOpen) {
+    // 播放器有自己的历史条目（playVideo 时 push）：这次返回本来就是从播放器
+    // 条目弹回评论/聊天条目，所以只关播放器、不再补推。上一版在这里补推一个
+    // 新条目，结果栈变成“根、聊天、补推条目”，评论条目被跳过，下一次返回
+    // 就直接到了聊天、甚至直接出网页——这就是评论里播视频、关视频后再滑
+    // 一次就退出网页的原因。改成只关、不补推，栈就和界面一步一步对上了。
+    closePlayer();
+    tgwebSeq = (e.state && e.state.tgweb) ? (e.state.seq || 0) : 0;
+    return;
+  }
+  if (deleteOpen) {
+    // 删除框没有自己的历史条目，还是老办法：先关框、再把历史深度补回去，
+    // 这样这次返回只关框，下一次返回才回上一页。
+    hideChannelDelete();
     tgwebPushState();
     return;
   }
@@ -450,9 +460,25 @@ window.addEventListener('popstate', (e)=>{
     } else if (!document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden')) {
       backToChannelsDirect();
     }
-    // 已经在根页面（全部频道/登录）时什么都不做，浏览器自然离开网页。
+    // 已经在根页面时，上面什么都不做，真正的兜底在下面：见“全局防退出”。
   } finally { tgwebPopping = false; }
+  // 全局防退出：不管在哪个页面，滑动返回（浏览器返回）都不能关闭网页，
+  // 只能手动关闭网页（关标签页/关浏览器）。非根页面上面已经回了上一页，
+  // 栈里还有 tgweb 条目，不会退出；只有回到根页面、且栈顶已经是最初
+  // 那条（seq==0）时，下一次返回就会真的离开，所以这里立刻再补推一
+  // 条根条目，栈永远保持“最初 + 一条 tgweb”，下一次返回又弹回最初、
+  // 又补推，永远出不去。注意这段在 finally 之后跑，tgwebPopping 已
+  // 经复位，push 才不会被挡住。
+  if (tgwebSeq === 0) {
+    const isNonRoot = !document.getElementById('commentsView').classList.contains('hidden') || !document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden');
+    if (!isNonRoot) tgwebPushState();
+  }
 });
+// 进来就先占一个历史条目：不然用户在根页面（所有频道/登录页）一滑，
+  // 浏览器直接就出网页了，popstate 根本没机会跑、补推也来不及。
+  // 有了这一条，根页面一滑是弹回最初那条，上面 popstate 的全局防退出
+  // 再补推一条，永远在 tgweb 里打转，只能手动关标签页。
+tgwebPushState();
 async function openChannelLink(username, msgId){
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
@@ -833,14 +859,28 @@ function seekPlayerFromEvent(e){
   prog.addEventListener('pointerup', endDrag);
   prog.addEventListener('pointercancel', endDrag);
 })();
+// 播放器有没有自己的历史条目：playVideo 打开时 push 一次就记 true，
+// 已经打开时再播另一个视频不重复 push；closePlayer 直接关时清掉，
+// 这样 × 关闭和 Esc 就知道该走 history.back() 还是直接关。
+let playerHistoryPushed = false;
 function closePlayer(){
   const p = document.getElementById('player');
+  // 关播放器时正在长按倍速也一并结束，免得倍速带到下一个视频。
+  try{ endLongPress(); }catch(e){}
   p.pause(); p.removeAttribute('src'); p.load();
   document.querySelector('#playerModal .modal-box').classList.remove('portrait-video');
   document.getElementById('playerModal').classList.add('hidden');
   document.body.style.overflow = '';
   playerDragging = false;
+  playerHistoryPushed = false;
   updatePlayerProgress();
+}
+function closePlayerViaBack(){
+  // × 关闭 / Esc 关闭：播放器有自己的历史条目时走浏览器返回，让 popstate
+  // 去关播放器，历史深度才对得上；否则直接关，不然下一次返回会先弹到
+  // 一个已经关掉的播放器条目，界面直接跳过一页。
+  if (playerHistoryPushed && tgwebSeq > 0) { history.back(); return; }
+  closePlayer();
 }
 // 双击快进/快退：左半边快退 10 秒，右半边快进 10 秒，中间弹一下提示就消失。
 // 不只视频框里，播放器黑边区域（视频框外面）双击也一样生效，左右按屏幕中间分。
@@ -911,16 +951,57 @@ function swipeExcluded(target, x, y){
   const r = p.getBoundingClientRect();
   return !!(r.width && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && y > r.bottom - 48);
 }
+// 长按倍速：按住视频 500ms 不动就切到 2x，松手立刻恢复原来倍速。
+// 和滑动快进共用同一套起点/终点判断，所以长按不会和滑动、双击、
+// 进度条拖动抢：起点在进度条、关闭按钮、视频底部 48px 原生控制条上的
+// 不启动；按住后一动超过 20px 就算滑动、取消长按计时；已经在滑动
+// 快进时也不再切倍速。松手后的那个 click 会误触发播放/暂停，
+// 所以松手时把 swipeEndAt 刷新一下，复用下面已有的 400ms 内 click 拦截。
+let speedPressTimer = null, speedPressActive = false, speedPressOrigRate = 1;
+function startLongPress(){
+  if (speedPressTimer || speedPressActive) return;
+  const p = document.getElementById('player');
+  if (!p || p.paused) return;
+  speedPressTimer = setTimeout(()=>{
+    speedPressTimer = null;
+    const v = document.getElementById('player');
+    if (!v || v.paused) return;
+    speedPressOrigRate = v.playbackRate || 1;
+    if (speedPressOrigRate === 2) return;
+    v.playbackRate = 2;
+    speedPressActive = true;
+    const f = document.getElementById('seekFeedback');
+    if (f) { f.textContent = '2x 倍速'; f.style.left = '50%'; f.classList.add('show'); }
+  }, 500);
+}
+function cancelLongPressTimer(){
+  if (speedPressTimer) { clearTimeout(speedPressTimer); speedPressTimer = null; }
+}
+function endLongPress(){
+  cancelLongPressTimer();
+  if (!speedPressActive) return;
+  speedPressActive = false;
+  const v = document.getElementById('player');
+  if (v) v.playbackRate = speedPressOrigRate || 1;
+  const f = document.getElementById('seekFeedback');
+  if (f) { f.classList.remove('show'); clearTimeout(seekFeedbackTimer); }
+  // 松手后浏览器补的 click 别误触播放/暂停。
+  swipeEndAt = Date.now();
+}
 function swipeStart(x, y, target){
   if (swipeExcluded(target, x, y)) return;
   const p = document.getElementById('player');
   swipeStartX = x; swipeStartY = y;
   swipeStartTime = p.currentTime || 0;
   swipeActive = false; swipeDelta = 0; swipeTracking = true;
+  startLongPress();
 }
 function swipeMove(x, y){
   if (!swipeTracking) return;
   const dx = x - swipeStartX, dy = y - swipeStartY;
+  // 按住后一动就不是长按了：动超过 20px 就取消长按计时，已经切到 2x
+  // 的也恢复原速，接下来只算滑动快进。
+  if (Math.abs(dx) > 20 || Math.abs(dy) > 20) endLongPress();
   if (!swipeActive) {
     if (Math.abs(dx) <= 24 || Math.abs(dx) <= Math.abs(dy)) return;
     swipeActive = true;
@@ -938,6 +1019,8 @@ function swipeMove(x, y){
   }
 }
 function endSwipe(endX, endY){
+  // 松手/取消都先结束长按倍速：没到 500ms 的只取消计时，到 2x 的恢复原速。
+  endLongPress();
   const f = document.getElementById('seekFeedback');
   // 终点再算一次：move 没来过、或者被浏览器取消过，只要终点距离够都算滑动。
   if (swipeTracking && endX !== undefined && endY !== undefined) {
@@ -990,7 +1073,7 @@ playerModalEl.addEventListener('touchcancel', e=>{
 playerModalEl.addEventListener('click', e=>{
   if (Date.now() - swipeEndAt < 400) { e.preventDefault(); e.stopPropagation(); }
 }, true);
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePlayer(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !document.getElementById('playerModal').classList.contains('hidden')) closePlayerViaBack(); });
 function backToChannelsDirect(){
   closePlayer();
   // 栈里有上一页就回上一页（比如机器人里点链接进了频道，就回机器人），
@@ -1568,6 +1651,13 @@ async function clickInlineBtn(channelId, msgId, row, col){
 function playVideo(channelId, msgId){
   // 只弹出播放器，不滚动页面、不移动列表位置
   const p = document.getElementById('player');
+  // 播放器自己占一个历史条目：返回时先弹回这个条目、只关播放器，
+  // 再返回才回评论/聊天，这样评论里播视频再返回就不会直接出网页。
+  // 已经打开时换视频不重复 push，免得关一次要返回两次。
+  if (document.getElementById('playerModal').classList.contains('hidden')) {
+    tgwebPushState();
+    playerHistoryPushed = true;
+  }
   document.getElementById('playerModal').classList.remove('hidden');
   document.body.style.overflow = 'hidden';
   playerDragging = false;
