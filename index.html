@@ -37,7 +37,7 @@ video{width:100%;max-height:520px;background:#000;border-radius:12px}
 #loginView .login-box{margin:40px auto}
 .login-step-title{font-size:18px;font-weight:700;margin:0 0 16px;text-align:center}
 .channels-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.channel-card{border:1px solid #222;border-radius:12px;padding:14px;cursor:pointer;background:#0d0d0d}
+.channel-card{border:1px solid #222;border-radius:12px;padding:14px;cursor:pointer;background:#0d0d0d;user-select:none;-webkit-user-select:none}
 .channel-card:hover{border-color:#555;background:#141414}
 .channel-row{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .channel-row .channel-info{min-width:0}
@@ -297,6 +297,19 @@ a.kb-btn{display:block}
   <button class="modal-close" onclick="closePlayer()">× 关闭</button>
 </div>
 
+<!-- 全部频道长按弹出的删除确认：只在全部频道列表里长按才出现，点开频道后不出现。
+     频道和群组是退出，机器人是删对话，文案按类型区分，私密的退出后可能回不来，所以要先确认。 -->
+<div id="channelDeleteModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:200;padding:16px">
+  <div style="background:#111;border:1px solid #333;border-radius:12px;padding:20px;max-width:340px;width:100%">
+    <div id="channelDeleteTitle" style="font-weight:700;margin-bottom:8px"></div>
+    <div id="channelDeleteHint" class="muted" style="margin-bottom:16px"></div>
+    <div style="display:flex;gap:10px">
+      <button id="channelDeleteConfirm" onclick="confirmChannelDelete()" style="background:#c0392b;color:#fff;border-color:#c0392b">删除</button>
+      <button onclick="hideChannelDelete()">取消</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let currentChannelId = null;
 let currentChannelTitle = '';
@@ -550,10 +563,46 @@ async function loadChannels(){
     const d = await api('/api/channels');
     joinedIds = new Set(d.channels.map(c=>c.id));
     document.getElementById('channels').innerHTML = d.channels.length ? d.channels.map(c=>
-      `<div class="channel-card" data-id="${c.id}" data-title="${esc(c.title)}" data-username="${esc(c.username||'')}"><b>${esc(c.title)}</b>${c.type==='bot'?' <span class="muted">bot</span>':''}<br>
+      `<div class="channel-card" data-id="${c.id}" data-title="${esc(c.title)}" data-username="${esc(c.username||'')}" data-type="${esc(c.type||'channel')}"><b>${esc(c.title)}</b>${c.type==='bot'?' <span class="muted">bot</span>':''}<br>
        <span class="muted">${c.username?'@'+esc(c.username):''}</span></div>`).join('')
       : '<div class="muted">还没有订阅，先搜索并添加一个。</div>';
   }catch(e){ /* 未登录时 refreshStatus 已处理 */ }
+}
+// 全部频道长按删除：频道、群组、机器人都在这个列表里，长按都弹出同一个确认框，
+// 只是文案按类型区分。频道/群组是退出，机器人是删对话，私密的退出后可能回不来。
+let channelDeleteTarget = null;
+function channelDeleteKind(type){
+  if (type === 'bot') return {name: '机器人', verb: '删除机器人', hint: '删除后将清除与该机器人的对话，之后可以重新开始对话。'};
+  if (type === 'chat') return {name: '群组', verb: '删除群组', hint: '删除后将退出该群组，私密群组退出后没有邀请链接就回不来了，请确认。'};
+  return {name: '频道', verb: '删除频道', hint: '删除后将退出该频道，私密频道退出后没有邀请链接就回不来了，请确认。'};
+}
+function showChannelDelete(id, title, username, type){
+  const kind = channelDeleteKind(type);
+  channelDeleteTarget = {id, title, username, type};
+  document.getElementById('channelDeleteTitle').textContent = kind.verb + '：' + (title || ('#' + id));
+  document.getElementById('channelDeleteHint').textContent = kind.hint;
+  document.getElementById('channelDeleteConfirm').textContent = kind.verb;
+  document.getElementById('channelDeleteModal').classList.remove('hidden');
+}
+function hideChannelDelete(){
+  channelDeleteTarget = null;
+  document.getElementById('channelDeleteModal').classList.add('hidden');
+}
+async function confirmChannelDelete(){
+  if (!channelDeleteTarget) return;
+  const target = channelDeleteTarget;
+  const btn = document.getElementById('channelDeleteConfirm');
+  btn.disabled = true;
+  try{
+    await api('/api/leave',{method:'POST', body:JSON.stringify({channel_id: target.id, username: target.username || null})});
+    hideChannelDelete();
+    alert('已删除：' + (target.title || ('#' + target.id)));
+    loadChannels();
+  }catch(e){
+    alert(e.message);
+  }finally{
+    btn.disabled = false;
+  }
 }
 function fmtPlayerTime(s){
   if (!isFinite(s) || s < 0) return '0:00';
@@ -1227,10 +1276,46 @@ document.getElementById('searchResults').addEventListener('click', e=>{
   loadChat(id, title, username);
 });
 document.getElementById('channels').addEventListener('click', e=>{
+  // 长按弹框后松手会紧接着触发一次 click，这次 click 必须吞掉，不然刚弹出的确认框
+  // 还没看清就直接进频道了。短按没有长按标记，照常进频道。
+  if (suppressChannelClick) { suppressChannelClick = false; return; }
   const card = e.target.closest('.channel-card');
   if (!card) return;
   navStack = [];
   loadChat(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '');
+});
+// 长按检测：pointer 事件同时覆盖触屏和鼠标按住。600 毫秒到了就弹删除框，
+// 松手、取消、手指滑动超过 10 像素都算没按住，直接取消计时，正常滑动列表不会误弹。
+let longPressTimer = null;
+let longPressStartX = 0;
+let longPressStartY = 0;
+let suppressChannelClick = false;
+const channelsEl = document.getElementById('channels');
+function cancelLongPress(){
+  if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+}
+channelsEl.addEventListener('pointerdown', e=>{
+  const card = e.target.closest('.channel-card');
+  if (!card) return;
+  cancelLongPress();
+  longPressStartX = e.clientX;
+  longPressStartY = e.clientY;
+  longPressTimer = setTimeout(()=>{
+    longPressTimer = null;
+    suppressChannelClick = true;
+    showChannelDelete(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '', card.dataset.type || 'channel');
+  }, 600);
+});
+channelsEl.addEventListener('pointerup', cancelLongPress);
+channelsEl.addEventListener('pointercancel', cancelLongPress);
+channelsEl.addEventListener('pointerleave', cancelLongPress);
+channelsEl.addEventListener('pointermove', e=>{
+  if (!longPressTimer) return;
+  if (Math.abs(e.clientX - longPressStartX) > 10 || Math.abs(e.clientY - longPressStartY) > 10) cancelLongPress();
+});
+// 手机长按本来会弹出系统菜单/选词，卡片上直接禁掉，避免系统菜单盖住删除框。
+channelsEl.addEventListener('contextmenu', e=>{
+  if (e.target.closest('.channel-card')) e.preventDefault();
 });
 refreshStatus();
 </script></body></html>

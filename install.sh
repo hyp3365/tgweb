@@ -4,9 +4,19 @@ set -e
 # 用法：bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh)
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   echo "用法：bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh)"
+  echo "  已安装过再跑一次就是更新：会拉最新代码并重建，已有 .env 和 data 不会被覆盖。"
+  echo "  加 --force 会跳过 pull，直接强制更新到远端最新版（本地改动会被暂存，见下面）。"
+  echo "  例：bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh) --force"
   echo "安装目录：\${TGWEB_DIR:-/root/telegram-stream}，已有 .env 不会被覆盖，改配置用 tg 命令。"
   echo "安装后必须绑定域名或有证书的 IP，不提供 HTTP 访问；证书要先放在 /root/cert/<域名或IP>/ 里，或用 TGWEB_DOMAIN 环境变量指定要绑的域名/IP。"
   exit 0
+fi
+# --force：直接强制更新，不先试 pull。没加时也一样能更新：pull 成功就用 pull，
+# pull 失败（本地改动、分支分叉）时只要能拉到远端就强制更新，不会悄悄用旧代码构建；
+# 只有拉都拉不到（网络问题）时才停下来。
+FORCE_UPDATE=0
+if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+  FORCE_UPDATE=1
 fi
 REPO="https://github.com/hyp3365/tgweb.git"
 DIR="${TGWEB_DIR:-/root/telegram-stream}"
@@ -28,12 +38,38 @@ docker compose version >/dev/null 2>&1 || { echo "Docker Compose 未装好，请
 
 # 取代码：已有目录且不是 git 仓库时先备份，再全新克隆，并把旧 .env 和 data 拷回来
 if [ -d "$DIR/.git" ]; then
-  # pull 失败就停下来，不要悄悄用旧代码继续构建：本地改动、分支分叉、网络中断
-  # 时继续装，装完显示“已启动”会让用户误以为已经是最新版。
-  if ! (cd "$DIR" && git pull --ff-only); then
-    echo "git pull 失败，已停止安装，没有用旧代码继续构建。"
-    echo "请先在 $DIR 里处理本地改动或分支分叉（git status / git stash），再重新运行安装。"
-    exit 1
+  # 已安装过再跑就是更新。强制更新只动 git 跟踪的文件，.env 和 data/ 里的 session
+  # 是未跟踪文件，不会被 reset 动到；本地改过跟踪文件时先 stash 起来（不带 -u，
+  # 不动未跟踪文件），更新完如果需要可以在目录里用 git stash pop 找回来。
+  _force_update() {
+    local _branch _old _new
+    _branch="$(git -C "$DIR" symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null | sed 's|^origin/||')"
+    if [ -z "$_branch" ] || ! git -C "$DIR" rev-parse --verify "origin/$_branch" >/dev/null 2>&1; then
+      _branch="main"
+    fi
+    _old="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "?")"
+    if ! git -C "$DIR" fetch origin; then
+      echo "拉取远端失败，已停止安装，没有用旧代码继续构建，请检查网络后再试。"
+      exit 1
+    fi
+    _new="$(git -C "$DIR" rev-parse --short "origin/$_branch" 2>/dev/null || echo "?")"
+    if [ "$_old" = "$_new" ]; then
+      echo "已经是最新版（$_new）。"
+      return 0
+    fi
+    if [ -n "$(git -C "$DIR" status --porcelain 2>/dev/null | grep -v '^??' || true)" ]; then
+      git -C "$DIR" stash push -m "install force-update backup $_old" 2>/dev/null || true
+      echo "注意：本地改动已暂存到 git stash，在 $DIR 里用 git stash pop 可以找回来。"
+    fi
+    git -C "$DIR" reset --hard "origin/$_branch" || { echo "强制更新失败，已停止安装。"; exit 1; }
+    echo "已强制更新：$_old -> $_new"
+  }
+  if [ "$FORCE_UPDATE" = "1" ]; then
+    echo "已加 --force，直接强制更新到远端最新版。"
+    _force_update
+  elif ! (cd "$DIR" && git pull --ff-only); then
+    echo "git pull 没法快进（本地有改动或分支分叉），改走强制更新，不会悄悄用旧代码构建。"
+    _force_update
   fi
 elif [ -d "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
   BACKUP="${DIR}.bak.$(date +%Y%m%d%H%M%S)"

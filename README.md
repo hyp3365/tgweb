@@ -4,6 +4,13 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh)
 ```
 
+更新：已安装过再跑一次一键安装就是强制更新，也可以直接用 tg update。
+
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/hyp3365/tgweb/main/install.sh) --force
+tg update
+```
+
 tg
 
 ```
@@ -23,5 +30,6 @@ tg restore-session
 tg domain [域名]
 tg uninstall
 tg restart
+tg update
 tg help
 ```

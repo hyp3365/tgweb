@@ -17,6 +17,7 @@
 #   tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）
 #   tg uninstall      全部卸载（会提示输入 yes 确认）
 #   tg restart        重启服务
+#   tg update         拉取最新代码并重新构建（已装过的再跑一键安装也能强制更新）
 #   tg help           帮助
 # 改完 api_id / api_hash / 删除后会自动重启服务，不用再手动 docker compose。
 # api_hash 不走网页，只在服务器终端里输入，终端输入时不回显。
@@ -139,6 +140,65 @@ restart_service() {
     return 1
   }
   echo "服务已重启。"
+}
+
+do_update() {
+  # 更新：只动 git 跟踪的文件，.env 和 data/ 里的 session 是未跟踪文件，不会被 reset 动到。
+  # 本地改过跟踪文件时先 stash 起来（不带 -u，不动未跟踪文件），更新完如果需要可以用 git stash pop 找回来。
+  if [ ! -d "$APP_DIR/.git" ]; then
+    echo "安装目录 $APP_DIR 不是 git 仓库，没法用 tg update 更新。"
+    echo "请用一键安装重新装一次（已有目录会备份后全新克隆，.env 和 data 会拷回来）。"
+    return 1
+  fi
+  local branch old_sha new_sha stashed=0
+  branch="$(git -C "$APP_DIR" symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null | sed 's|^origin/||')"
+  if [ -z "$branch" ] || ! git -C "$APP_DIR" rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+    branch="main"
+  fi
+  old_sha="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")"
+  echo "当前版本：$old_sha，正在从远端拉取 $branch …"
+  if ! git -C "$APP_DIR" fetch origin; then
+    echo "拉取失败，服务没动，请检查网络后再试。"
+    return 1
+  fi
+  new_sha="$(git -C "$APP_DIR" rev-parse --short "origin/$branch" 2>/dev/null || echo "?")"
+  if [ "$old_sha" = "$new_sha" ]; then
+    echo "已经是最新版（$new_sha），不用更新代码，仍会重新安装脚本并重建服务。"
+  else
+    if [ -n "$(git -C "$APP_DIR" status --porcelain 2>/dev/null | grep -v '^??' || true)" ]; then
+      git -C "$APP_DIR" stash push -m "tg update backup $old_sha" 2>/dev/null || true
+      stashed=1
+    fi
+    if ! git -C "$APP_DIR" reset --hard "origin/$branch"; then
+      echo "强制更新失败，服务没动。"
+      return 1
+    fi
+    echo "已更新：$old_sha -> $new_sha"
+    if [ "$stashed" = "1" ]; then
+      echo "注意：本地改动已暂存到 git stash，在 $APP_DIR 里用 git stash pop 可以找回来。"
+    fi
+  fi
+  # 更新 tg/tg-domain 脚本：正在运行的 tg 本身不能用 cp 直接覆盖（会改正在读的文件），
+  # 先拷到临时文件再 mv 过去，mv 换 inode，正在运行的旧文件读完这一轮不受影响。
+  if [ -f "$APP_DIR/tg" ]; then
+    cp "$APP_DIR/tg" /tmp/tg.new && chmod +x /tmp/tg.new && mv /tmp/tg.new /usr/local/bin/tg 2>/dev/null || echo "注意：/usr/local/bin/tg 没更新成功，请手动拷 $APP_DIR/tg 过去。"
+  fi
+  if [ -f "$APP_DIR/tg-domain.sh" ]; then
+    cp "$APP_DIR/tg-domain.sh" /tmp/tg-domain.new && chmod +x /tmp/tg-domain.new && mv /tmp/tg-domain.new /usr/local/bin/tg-domain 2>/dev/null || echo "注意：/usr/local/bin/tg-domain 没更新成功，请手动拷 $APP_DIR/tg-domain.sh 过去。"
+  fi
+  if [ -n "$TG_NO_RESTART" ]; then
+    echo "（测试模式，跳过重建）"
+    return 0
+  fi
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    echo "找不到 $COMPOSE_FILE，代码已更新，改完配置后请手动重启服务。"
+    return 1
+  fi
+  (cd "$APP_DIR" && docker compose up -d --build) || {
+    echo "重建失败：请确认你是用 root 身份运行，并且 Docker 已安装。"
+    return 1
+  }
+  echo "更新完成，服务已重建。"
 }
 
 do_set_id() {
@@ -530,6 +590,7 @@ show_help() {
   echo "  tg domain [域名]  绑定/更换域名（不给域名就列出已有证书选一个）"
   echo "  tg uninstall    全部卸载（会提示输入 yes 确认）"
   echo "  tg restart      重启服务"
+  echo "  tg update       拉取最新代码并重新构建"
   echo "  tg help         帮助"
 }
 
@@ -558,8 +619,9 @@ menu() {
     echo "11) 设置并行下载数（1-4，默认 2）"
     echo "12) 同步 session 到备份仓库"
     echo "13) 从备份仓库恢复 session"
+    echo "14) 更新到最新版"
     echo "0) 退出"
-    read -r -p "选一个 [0-13]： " choice
+    read -r -p "选一个 [0-14]： " choice
     case "$choice" in
       1)
         read -r -p "api_id： " v
@@ -605,6 +667,9 @@ menu() {
       13)
         do_restore_session
         ;;
+      14)
+        do_update
+        ;;
       8)
         do_uninstall
         if [ $? -eq 0 ]; then
@@ -617,11 +682,11 @@ menu() {
         break
         ;;
       *)
-        echo "没有这个选项，选 0-13。"
+        echo "没有这个选项，选 0-14。"
         ;;
     esac
     case "$choice" in
-      1|2|3|4|5|6|7|8|9|10|11|12|13)
+      1|2|3|4|5|6|7|8|9|10|11|12|13|14)
         pause_for_key
         ;;
     esac
@@ -644,6 +709,7 @@ case "${1:-}" in
   domain) do_domain "${@:2}" ;;
   uninstall) do_uninstall "${2:-}" ;;
   restart) restart_service ;;
+  update) do_update ;;
   help|-h|--help) show_help ;;
   "") menu ;;
   *) echo "未知命令：$1"; show_help; exit 1 ;;

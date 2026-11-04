@@ -649,6 +649,39 @@ async def join(request: Request, body: JoinIn):
     return {"ok": True, "joined": _chat_info(entity)}
 
 
+class LeaveIn(BaseModel):
+    channel_id: int
+    username: str | None = None
+
+
+@app.post("/api/leave")
+async def leave_channel(request: Request, body: LeaveIn):
+    # 删除频道/群组/机器人：全部频道列表里三种都会出现，所以这里不分类型，
+    # 一律用 Telethon 的 delete_dialog：频道和群组就是退出，机器人就是删对话。
+    # 私密频道/群组退出后没有邀请链接就回不来了，前端长按弹出的确认框里会先说明这一点。
+    # 频道创建者等删不掉的情况会直接报 Telegram 的错，不会假装成功。
+    check_web_auth(request)
+    client = await require_login()
+    entity = await _channel_entity(client, body.channel_id, body.username)
+    info = _chat_info(entity)
+    try:
+        await client.delete_dialog(entity)
+    except Exception as e:
+        code, detail = _tg_error(e)
+        raise HTTPException(status_code=code, detail=detail)
+    _invalidate_dialogs()
+    _recently_joined[:] = [e for e in _recently_joined if getattr(e, "id", None) != entity.id]
+    _recently_joined_time.pop(entity.id, None)
+    _entity_cache.pop(entity.id, None)
+    _entity_cache_time.pop(entity.id, None)
+    for uname in list(_entity_cache_by_username.keys()):
+        ent = _entity_cache_by_username[uname]
+        if getattr(ent, "id", None) == entity.id:
+            _entity_cache_by_username.pop(uname, None)
+            _entity_cache_by_username_time.pop(uname, None)
+    return {"ok": True, "deleted": info}
+
+
 @app.get("/api/channels")
 async def my_channels(request: Request):
     check_web_auth(request)
