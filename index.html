@@ -416,6 +416,43 @@ function pushNavStack(){
   if (!currentChannelId) return;
   navStack.push({id: currentChannelId, title: currentChannelTitle, username: currentChannelUsername, view: currentViewKind()});
 }
+// 滑动返回不再直接关闭网页：tgweb 是单页应用，以前内部跳转（聊天、视频、评论）
+// 根本不写浏览器历史，所以手机上从屏幕边缘一滑、浏览器一返回，整个网页就退出了。
+// 现在每次内部新跳转都 push 一个历史状态，浏览器返回（包括边缘滑动返回）就先触发
+// popstate，由这里在 tgweb 内部回上一页；只有已经在全部频道列表（根页面）时再返回，
+// 才真的离开网页。播放器、删除框这类弹窗先关弹窗、再把历史深度补回去，
+// 这样第一次返回关弹窗、第二次返回才回上一页，不会一次滑就关网页。
+// tgwebSeq 是当前历史状态的序号：根页面是 0，每 push 一次加 1，popstate 时从
+// 新状态里恢复；返回按钮只有在 seq>0（即有内部上一页）时才走 history.back()，
+// 否则直接走原来的返回逻辑，避免在没有历史时一按返回就关网页。
+let tgwebSeq = 0;
+let tgwebPopping = false;
+function tgwebPushState(){
+  if (tgwebPopping) return;
+  tgwebSeq++;
+  try{ history.pushState({tgweb:true, seq:tgwebSeq}, ''); }catch(e){}
+}
+window.addEventListener('popstate', (e)=>{
+  const playerOpen = !document.getElementById('playerModal').classList.contains('hidden');
+  const deleteOpen = !document.getElementById('channelDeleteModal').classList.contains('hidden');
+  if (playerOpen || deleteOpen) {
+    // 弹窗先关，历史深度补回去：下一次返回才回上一页，这次不回上一页。
+    if (playerOpen) closePlayer();
+    if (deleteOpen) hideChannelDelete();
+    tgwebPushState();
+    return;
+  }
+  tgwebSeq = (e.state && e.state.tgweb) ? (e.state.seq || 0) : 0;
+  tgwebPopping = true;
+  try{
+    if (!document.getElementById('commentsView').classList.contains('hidden')) {
+      backFromCommentsDirect();
+    } else if (!document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden')) {
+      backToChannelsDirect();
+    }
+    // 已经在根页面（全部频道/登录）时什么都不做，浏览器自然离开网页。
+  } finally { tgwebPopping = false; }
+});
 async function openChannelLink(username, msgId){
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
@@ -954,24 +991,33 @@ playerModalEl.addEventListener('click', e=>{
   if (Date.now() - swipeEndAt < 400) { e.preventDefault(); e.stopPropagation(); }
 }, true);
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closePlayer(); });
-function backToChannels(){
+function backToChannelsDirect(){
   closePlayer();
   // 栈里有上一页就回上一页（比如机器人里点链接进了频道，就回机器人），
   // 栈空了才回全部频道列表。按钮文字也因此改成“返回”，不再写“返回所有频道”，
   // 因为返回的目的地不一定是全部频道列表。
+  // 这是真正的返回动作本身：popstate 和返回按钮的兜底都走它，它自己不 push 历史，
+  // 否则返回一次又 push 一次，历史永远减不下去。
   if (navStack.length) {
     const prev = navStack.pop();
-    if (prev.view === 'video') { loadVideos(prev.id, prev.title, prev.username); }
-    else { loadChat(prev.id, prev.title, prev.username); }
+    if (prev.view === 'video') { loadVideos(prev.id, prev.title, prev.username, {push:false}); }
+    else { loadChat(prev.id, prev.title, prev.username, {push:false}); }
     return;
   }
   currentChannelId = null;
   showView('channelsView');
   loadChannels();
 }
-function switchToChat(){ if (currentChannelId) loadChat(currentChannelId, currentChannelTitle, currentChannelUsername); }
-function switchToVideo(){ if (currentChannelId) loadVideos(currentChannelId, currentChannelTitle, currentChannelUsername); }
-async function loadVideos(channelId, title, username=''){
+function backToChannels(){
+  // 有内部历史时走浏览器返回，让 popstate 去执行 backToChannelsDirect，
+  // 这样返回按钮和边缘滑动返回走同一条路，历史深度才对得上；
+  // 没有内部历史时直接执行，避免一按返回就关网页。
+  if (tgwebSeq > 0) { history.back(); return; }
+  backToChannelsDirect();
+}
+function switchToChat(){ if (currentChannelId) loadChat(currentChannelId, currentChannelTitle, currentChannelUsername, {push:false}); }
+function switchToVideo(){ if (currentChannelId) loadVideos(currentChannelId, currentChannelTitle, currentChannelUsername, {push:false}); }
+async function loadVideos(channelId, title, username='', opts={}){
   currentChannelId = channelId;
   currentChannelTitle = title || '';
   currentChannelUsername = username || '';
@@ -983,6 +1029,7 @@ async function loadVideos(channelId, title, username=''){
   document.getElementById('videos').innerHTML = '正在加载…';
   document.getElementById('loadMoreWrap').classList.add('hidden');
   showView('channelView');
+  if (opts.push !== false) tgwebPushState();
   window.scrollTo({top:0,behavior:'smooth'});
   await loadVideoPage(false);
 }
@@ -1171,7 +1218,7 @@ function chatBubble(m, channelId, usernameOverride){
   const timeHtml = `<div class="chat-time">${chatTimeStr(m.date)}</div>`;
   return `<div class="chat-msg${isOwn ? ' own' : ''}" data-msg-id="${m.msg_id}" data-date="${chatDateKey(m.date)}">${avatar}<div class="chat-bubble">${nameHtml}${body}${timeHtml}</div></div>`;
 }
-async function loadChat(channelId, title, username=''){
+async function loadChat(channelId, title, username='', opts={}){
   currentChatChannelId = channelId;
   currentChannelId = channelId;
   currentChannelTitle = title || '';
@@ -1188,6 +1235,7 @@ async function loadChat(channelId, title, username=''){
   chatOldestId = 0; chatHasMore = false;
   chatDisplayedIds = new Set(); chatMsgHash = {}; chatNewestId = 0; hideChatNewMsgBar();
   showView('chatView');
+  if (opts.push !== false) tgwebPushState();
   window.scrollTo({top:0,behavior:'smooth'});
   await loadChatPage(false);
 }
@@ -1416,14 +1464,19 @@ async function openComments(channelId, msgId){
   document.getElementById('commentMessages').innerHTML = '正在加载评论…';
   document.getElementById('commentLoadMoreWrap').classList.add('hidden');
   showView('commentsView');
+  tgwebPushState();
   window.scrollTo({top:0,behavior:'smooth'});
   await loadCommentPage(false);
 }
-function backFromComments(){
+function backFromCommentsDirect(){
   closePlayer();
   if (commentReturnTo === 'channelView' && currentChannelId) { showView('channelView'); }
-  else if (currentChannelId) { loadChat(currentChannelId, currentChannelTitle, currentChannelUsername); }
+  else if (currentChannelId) { loadChat(currentChannelId, currentChannelTitle, currentChannelUsername, {push:false}); }
   else { showView('channelsView'); loadChannels(); }
+}
+function backFromComments(){
+  if (tgwebSeq > 0) { history.back(); return; }
+  backFromCommentsDirect();
 }
 async function loadCommentPage(appendOlder){
   const box = document.getElementById('commentMessages');
