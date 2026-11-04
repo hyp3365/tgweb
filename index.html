@@ -313,6 +313,30 @@ a.kb-btn{display:block}
   </div>
 </div>
 
+<!-- 点 t.me 链接到还没加入的频道/群组时，在网页里提示要不要加入，绝不跳到 t.me、绝不跳到 Telegram App。
+     加入走 tgweb 自己的 /api/join，加入后直接在本页打开对话；点取消就留在 tgweb，什么都不做。 -->
+<div id="channelJoinModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:200;padding:16px">
+  <div style="background:#111;border:1px solid #333;border-radius:12px;padding:20px;max-width:340px;width:100%">
+    <div id="channelJoinTitle" style="font-weight:700;margin-bottom:8px"></div>
+    <div id="channelJoinHint" class="muted" style="margin-bottom:16px"></div>
+    <div style="display:flex;gap:10px">
+      <button id="channelJoinConfirm" onclick="confirmChannelJoin()">加入</button>
+      <button onclick="hideChannelJoin()">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 非对话类的 t.me 链接（贴纸、主题等）在 tgweb 里没有对应打开方式，也不跳到 App，只在网页里说明一下。 -->
+<div id="channelNoticeModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:200;padding:16px">
+  <div style="background:#111;border:1px solid #333;border-radius:12px;padding:20px;max-width:340px;width:100%">
+    <div id="channelNoticeTitle" style="font-weight:700;margin-bottom:8px"></div>
+    <div id="channelNoticeHint" class="muted" style="margin-bottom:16px"></div>
+    <div style="display:flex;gap:10px">
+      <button onclick="hideChannelNotice()">知道了</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let currentChannelId = null;
 let currentChannelTitle = '';
@@ -417,26 +441,40 @@ function pushNavStack(){
   navStack.push({id: currentChannelId, title: currentChannelTitle, username: currentChannelUsername, view: currentViewKind()});
 }
 async function openChannelLink(username, msgId){
+  // joinedIds 可能还没刷出来（刚打开页面还没调 loadChannels）：先刷一次，
+  // 避免把已加入的误判成未加入、每次都弹加入确认。
+  if (!joinedIds.size) { try{ await loadChannels(); }catch(e){} }
   try{
     const d = await api('/api/resolve?username='+encodeURIComponent(username));
-    if (currentChannelId && currentChannelId !== d.id) pushNavStack();
-    await loadChat(d.id, d.title||username, d.username||username);
-    if (msgId) await jumpToChatMessage(Number(msgId));
-    return true;
+    // 机器人、私聊不用加入；已经加入的直接打开，不弹确认。
+    if (d.type === 'bot' || d.type === 'private' || joinedIds.has(d.id)) {
+      try{
+        if (currentChannelId && currentChannelId !== d.id) pushNavStack();
+        await loadChat(d.id, d.title||username, d.username||username);
+        if (msgId) await jumpToChatMessage(Number(msgId));
+      }catch(e){
+        // 已加入/机器人却打不开：也别跳 t.me（手机上会跳 App），在网页里提示加入再试。
+        showChannelJoin({joinArg:'@'+username, title:d.title||username, username:d.username||username, id:d.id, msgId});
+      }
+      return true;
+    }
+    // 频道/群组且还没加入：在网页里提示要不要加入，不跳 App；点加入走 /api/join，点取消留在 tgweb。
+    showChannelJoin({joinArg:'@'+username, title:d.title||username, username:d.username||username, id:d.id, msgId});
+    return false;
   }catch(e){
-    // 本页解析失败（私密、用户名不对、请求失败等）也不弹错：是链接就在本页打开，
-    // 直接在当前标签页打开 t.me 原链接，浏览器返回键可以回到 tgweb。
-    location.href = 'https://t.me/' + username + (msgId ? '/' + msgId : '');
+    // 解析失败（私密、用户名不对、请求失败等）：不知道标题/类型，也别跳 t.me，
+    // 同样在网页里提示加入，点加入走 /api/join，加入失败原因会写在提示框里，点取消留在 tgweb。
+    showChannelJoin({joinArg:'@'+username, title:username, username, msgId});
     return false;
   }
 }
-// 所有 t.me 链接的统一入口：是链接就在本页打开，绝不 window.open、新标签页，
-// 也不管它是什么路径——不再弹“打不开”或“请求失败”。
+// 所有 t.me 链接的统一入口：是链接就在本网页里处理，绝不 window.open、新标签页，
+// 更绝不跳到 t.me（手机上 t.me 是 App 的通用链接，跳过去就会打开 Telegram App 并提示加入）。
 // 文本链接、内联按钮、机器人回调按钮、图片说明里的链接都走这里。
 // 规则：聊天类（用户名、c/、s/、邀请）先在本页 tgweb 里打开对话；
-// 本页打不开（解析/加入/加载失败）时，退到当前标签页打开原链接；
-// 非聊天类（贴纸、分享、代理等）本页没有对话可开，直接在当前标签页打开原链接，
-// 分享/预览类如果带了内嵌的目标链接，就打开那个目标链接。
+// 还没加入的，在网页里提示要不要加入，加入走 /api/join，取消就留在 tgweb；
+// 非聊天类（贴纸、分享、代理等）本页没有对话可开，也只在网页里说明，不跳 App。
+// 非 t.me 的链接不在这里，仍按原来的规则在当前标签页打开。
 async function openTmeLink(url){
   let u = String(url || '').trim();
   if (/^t\.me\//i.test(u)) u = 'https://' + u;
@@ -445,64 +483,65 @@ async function openTmeLink(url){
   if (!/^(www\.)?t\.me$/i.test(parsed.hostname)) { location.href = u; return; }
   const parts = parsed.pathname.split('/').filter(Boolean);
   const first = parts[0] || '';
-  const openInPage = (link)=>{ location.href = link; };
-  try{
-    // 邀请链接：先在本页直接加入并打开；加入失败就本页打开原邀请链接，不弹错。
-    // 注意 /+邀请码 是一整个段（"+xyz"），不是单独的 "+" 再加一段。
-    if (first.startsWith('+') || first === 'joinchat') {
-      try{
-        const d = await api('/api/join',{method:'POST',body:JSON.stringify({channel:u})});
-        if (d.joined?.id) { joinedIds.add(d.joined.id); await loadChat(d.joined.id, d.joined.title||u, d.joined.username||''); }
-        else loadChannels();
-      }catch(e){ openInPage(u); }
-      return;
+  // 邀请链接：先在网页里提示要不要加入，不直接加入、不跳 App。
+  // 注意 /+邀请码 是一整个段（"+xyz"），不是单独的 "+" 再加一段。
+  if (first.startsWith('+') || first === 'joinchat') {
+    showChannelJoin({joinArg:u, title:'这个频道/群组', username:'', msgId:null});
+    return;
+  }
+  // 分享、即时预览：内嵌的目标链接才是用户要去的地方；没有内嵌链接就只在网页里说明，不跳 App。
+  if (first === 'share' || first === 'iv') {
+    const embedded = parsed.searchParams.get('url');
+    if (embedded) {
+      if (isTmeUrl(embedded)) { await openTmeLink(embedded); return; }
+      location.href = embedded; return;
     }
-    // 分享、即时预览：内嵌的目标链接才是用户要去的地方；没有内嵌链接就打开原链接。
-    if (first === 'share' || first === 'iv') {
-      const embedded = parsed.searchParams.get('url');
-      if (embedded) {
-        if (isTmeUrl(embedded)) { await openTmeLink(embedded); return; }
-        openInPage(embedded); return;
-      }
-      openInPage(u); return;
-    }
-    // 私密频道消息链接 t.me/c/频道号/消息号：频道号就是 Telethon 的频道 id（去掉 -100 前缀），
-    // 先在全部频道列表里找标题，找不到就用空标题直接按 id 打开，后端按 PeerChannel 兜底。
-    // 本页加载失败就本页打开原链接，不弹错。
-    if (first === 'c' && /^\d+$/.test(parts[1] || '')) {
-      const cid = Number(parts[1]);
-      const mid = parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null;
+    showChannelNotice('这个链接在 tgweb 里打不开', '这是个分享链接，里面没有目标频道/群组，tgweb 里打不开，也不会跳到 Telegram App。');
+    return;
+  }
+  // 私密频道消息链接 t.me/c/频道号/消息号：频道号就是 Telethon 的频道 id（去掉 -100 前缀），
+  // 先在全部频道列表里找标题，找不到就用空标题；已加入的直接打开，没加入的在网页里提示加入。
+  if (first === 'c' && /^\d+$/.test(parts[1] || '')) {
+    const cid = Number(parts[1]);
+    const mid = parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null;
+    let title = '', username = '';
+    try{
+      const d = await api('/api/channels');
+      if (d.channels) joinedIds = new Set(d.channels.map(c=>c.id));
+      const found = (d.channels || []).find(c => c.id === cid);
+      if (found) { title = found.title || ''; username = found.username || ''; }
+    }catch(e){}
+    if (joinedIds.has(cid)) {
       try{
-        let title = '', username = '';
-        try{
-          const d = await api('/api/channels');
-          const found = (d.channels || []).find(c => c.id === cid);
-          if (found) { title = found.title || ''; username = found.username || ''; }
-        }catch(e){}
         if (currentChannelId && currentChannelId !== cid) pushNavStack();
         await loadChat(cid, title, username);
         if (mid) await jumpToChatMessage(mid);
-      }catch(e){ openInPage(u); }
-      return;
+      }catch(e){
+        showChannelJoin({joinArg:String(cid), title:title || ('#' + cid), username, id:cid, msgId:mid});
+      }
+    } else {
+      showChannelJoin({joinArg:String(cid), title:title || ('#' + cid), username, id:cid, msgId:mid});
     }
-    // 公开预览 s/用户名：当成用户名打开，消息号如果有也跳过去；失败时 openChannelLink 已退到本页打开原链接。
-    if (first === 's' && parts[1]) {
-      await openChannelLink(parts[1], parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null);
-      return;
-    }
-    // 贴纸、主题、代理等根本不是对话的路径：不浪费一次解析请求，直接本页打开原链接。
-    if (['addstickers', 'addtheme', 'addlist', 'proxy', 'socks', 'setlanguage'].includes(first)) {
-      openInPage(u); return;
-    }
-    // 用户名、用户名/消息号：走原来的解析打开。?start= 这类机器人参数在本页打开对话时丢掉，
-    // 失败时 openChannelLink 已退到本页打开原链接。
-    if (first) {
-      await openChannelLink(first, parts[1] && /^\d+$/.test(parts[1]) ? Number(parts[1]) : null);
-      return;
-    }
-    // 其他任何路径（贴纸、主题、代理、空路径等）：不再判断、不再弹错，直接本页打开原链接。
-    openInPage(u);
-  }catch(e){ openInPage(u); }
+    return;
+  }
+  // 公开预览 s/用户名：当成用户名打开，消息号如果有也跳过去；未加入/失败时 openChannelLink 会弹网页内加入确认。
+  if (first === 's' && parts[1]) {
+    await openChannelLink(parts[1], parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null);
+    return;
+  }
+  // 贴纸、主题、代理等根本不是对话的路径：不解析、不跳 App，只在网页里说明。
+  if (['addstickers', 'addtheme', 'addlist', 'proxy', 'socks', 'setlanguage'].includes(first)) {
+    showChannelNotice('这个链接在 tgweb 里打不开', '这是贴纸/主题/代理等链接，不是频道/群组对话，tgweb 里打不开，也不会跳到 Telegram App。');
+    return;
+  }
+  // 用户名、用户名/消息号：走原来的解析打开。?start= 这类机器人参数在本页打开对话时丢掉，
+  // 未加入/失败时 openChannelLink 会弹网页内加入确认，绝不跳 App。
+  if (first) {
+    await openChannelLink(first, parts[1] && /^\d+$/.test(parts[1]) ? Number(parts[1]) : null);
+    return;
+  }
+  // 空路径等其他任何路径：只在网页里说明，不跳 App。
+  showChannelNotice('这个链接在 tgweb 里打不开', '这个 t.me 链接没有指向频道/群组对话，tgweb 里打不开，也不会跳到 Telegram App。');
 }
 function highlightChatMessage(el){
   if (!el) return;
@@ -722,6 +761,54 @@ async function confirmChannelDelete(){
   }finally{
     btn.disabled = false;
   }
+}
+// 网页内加入确认：target = {joinArg, title, username, id, msgId}
+// joinArg 是给 /api/join 的参数：@用户名、邀请链接原地址、或数字 id。
+// 加入成功后直接在本页打开对话；加入失败只在网页里把原因写在提示框里，不跳 t.me、不跳 App。
+let channelJoinTarget = null;
+function showChannelJoin(target){
+  channelJoinTarget = target;
+  const name = target.title || (target.username ? '@' + target.username : '') || target.joinArg || '';
+  document.getElementById('channelJoinTitle').textContent = '要不要加入：' + name;
+  document.getElementById('channelJoinHint').textContent = '加入后直接在 tgweb 里打开，不会跳到 Telegram App。';
+  document.getElementById('channelJoinConfirm').disabled = false;
+  document.getElementById('channelJoinModal').classList.remove('hidden');
+}
+function hideChannelJoin(){
+  channelJoinTarget = null;
+  document.getElementById('channelJoinModal').classList.add('hidden');
+}
+async function confirmChannelJoin(){
+  if (!channelJoinTarget) return;
+  const target = channelJoinTarget;
+  const btn = document.getElementById('channelJoinConfirm');
+  btn.disabled = true;
+  try{
+    const d = await api('/api/join',{method:'POST', body:JSON.stringify({channel: target.joinArg})});
+    const id = d.joined?.id || target.id;
+    if (id) joinedIds.add(id);
+    hideChannelJoin();
+    if (id) {
+      if (currentChannelId && currentChannelId !== id) pushNavStack();
+      try{
+        await loadChat(id, d.joined?.title || target.title || '', d.joined?.username || target.username || '');
+        if (target.msgId) await jumpToChatMessage(Number(target.msgId));
+      }catch(e){ alert(e.message); }
+    } else {
+      loadChannels();
+    }
+  }catch(e){
+    document.getElementById('channelJoinHint').textContent = '加入失败：' + (e.message || '请稍后再试');
+    btn.disabled = false;
+  }
+}
+function showChannelNotice(title, hint){
+  document.getElementById('channelNoticeTitle').textContent = title;
+  document.getElementById('channelNoticeHint').textContent = hint;
+  document.getElementById('channelNoticeModal').classList.remove('hidden');
+}
+function hideChannelNotice(){
+  document.getElementById('channelNoticeModal').classList.add('hidden');
 }
 function fmtPlayerTime(s){
   if (!isFinite(s) || s < 0) return '0:00';
