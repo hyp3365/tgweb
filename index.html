@@ -1276,9 +1276,11 @@ document.getElementById('searchResults').addEventListener('click', e=>{
   loadChat(id, title, username);
 });
 document.getElementById('channels').addEventListener('click', e=>{
-  // 长按弹框后松手会紧接着触发一次 click，这次 click 必须吞掉，不然刚弹出的确认框
-  // 还没看清就直接进频道了。短按没有长按标记，照常进频道。
-  if (suppressChannelClick) { suppressChannelClick = false; return; }
+  // 长按弹框后松手可能还产生一次 click，这次 click 绝不能进频道。
+  // 判断依据是弹框是不是开着，不用一个单独的标记：原来用标记时有个真 bug——
+  // 弹框在松手前就盖住了全屏，click 根本落不到 #channels 上，标记就一直残留，
+  // 导致长按后的下一次短按被白白吞掉一次，点一下没反应，再点才进频道。
+  if (!document.getElementById('channelDeleteModal').classList.contains('hidden')) return;
   const card = e.target.closest('.channel-card');
   if (!card) return;
   navStack = [];
@@ -1291,7 +1293,6 @@ document.getElementById('channels').addEventListener('click', e=>{
 let longPressTimer = null;
 let longPressStartX = 0;
 let longPressStartY = 0;
-let suppressChannelClick = false;
 const channelsEl = document.getElementById('channels');
 function cancelLongPress(){
   if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
@@ -1304,7 +1305,6 @@ channelsEl.addEventListener('pointerdown', e=>{
   longPressStartY = e.clientY;
   longPressTimer = setTimeout(()=>{
     longPressTimer = null;
-    suppressChannelClick = true;
     showChannelDelete(Number(card.dataset.id), card.dataset.title || '', card.dataset.username || '', card.dataset.type || 'channel');
   }, 500);
 });
@@ -1318,7 +1318,6 @@ channelsEl.addEventListener('pointermove', e=>{
 // 手机长按本来会弹出系统菜单/选词，而且有的浏览器在弹系统菜单时会直接取消 pointer，
 // 导致上面 500 毫秒的计时永远跑不到。所以系统菜单事件本身也当作长按处理：
 // 禁掉系统菜单，直接弹我们的删除框。电脑上右键卡片也会弹这个框，同样能删。
-// 注意：弹框在 #channels 外面，后面松手产生的 click 不会落到卡片上，不用再设 suppress。
 channelsEl.addEventListener('contextmenu', e=>{
   const card = e.target.closest('.channel-card');
   if (!card) return;

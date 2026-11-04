@@ -483,7 +483,11 @@ def _cache_entity(entity):
         _entity_cache_by_username_time[uname.lower()] = time.time()
 def _chat_info(entity):
     # 机器人是 User 类型，不是 Channel/Chat：原来 type 一律算 chat，搜索里也分不出来。
-    if isinstance(entity, Channel):
+    # 超级群组在 Telethon 里也是 Channel，但对用户来说它是群组：删的时候文案写“群组”
+    # 才对，写“频道”会让人以为退的是频道，动作虽然一样，提示不能错。
+    if isinstance(entity, Channel) and getattr(entity, "megagroup", False):
+        typ = "chat"
+    elif isinstance(entity, Channel):
         typ = "channel"
     elif isinstance(entity, User) and getattr(entity, "bot", False):
         typ = "bot"
@@ -663,6 +667,10 @@ async def leave_channel(request: Request, body: LeaveIn):
     check_web_auth(request)
     client = await require_login()
     entity = await _channel_entity(client, body.channel_id, body.username)
+    # 只给删全部频道列表里会出现的东西：频道、群组、机器人。私聊 User 不在列表里，
+    # 但接口本身没拦的话，拼一个私聊 id 就能把私聊记录清掉，这里直接拒绝。
+    if isinstance(entity, User) and not getattr(entity, "bot", False):
+        raise HTTPException(status_code=400, detail="只能删除频道、群组或机器人，私聊不在删除范围")
     info = _chat_info(entity)
     try:
         await client.delete_dialog(entity)

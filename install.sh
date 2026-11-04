@@ -42,7 +42,7 @@ if [ -d "$DIR/.git" ]; then
   # 是未跟踪文件，不会被 reset 动到；本地改过跟踪文件时先 stash 起来（不带 -u，
   # 不动未跟踪文件），更新完如果需要可以在目录里用 git stash pop 找回来。
   _force_update() {
-    local _branch _old _new
+    local _branch _old _new _stashed=0
     _branch="$(git -C "$DIR" symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null | sed 's|^origin/||')"
     if [ -z "$_branch" ] || ! git -C "$DIR" rev-parse --verify "origin/$_branch" >/dev/null 2>&1; then
       _branch="main"
@@ -58,10 +58,21 @@ if [ -d "$DIR/.git" ]; then
       return 0
     fi
     if [ -n "$(git -C "$DIR" status --porcelain 2>/dev/null | grep -v '^??' || true)" ]; then
-      git -C "$DIR" stash push -m "install force-update backup $_old" 2>/dev/null || true
-      echo "注意：本地改动已暂存到 git stash，在 $DIR 里用 git stash pop 可以找回来。"
+      # 和 tg update 一样的道理：stash 成功才算暂存住了，失败就直接停，
+      # 不能先谎称已暂存再 reset 把改动丢掉。
+      if git -C "$DIR" stash push -m "install force-update backup $_old" 2>/dev/null; then
+        _stashed=1
+        echo "注意：本地改动已暂存到 git stash，在 $DIR 里用 git stash pop 可以找回来。"
+      else
+        echo "本地改动暂存失败，已停止安装，改动没有动。"
+        exit 1
+      fi
     fi
-    git -C "$DIR" reset --hard "origin/$_branch" || { echo "强制更新失败，已停止安装。"; exit 1; }
+    git -C "$DIR" reset --hard "origin/$_branch" || {
+      if [ "$_stashed" = "1" ]; then git -C "$DIR" stash pop 2>/dev/null || true; fi
+      echo "强制更新失败，已停止安装，本地改动已还原。"
+      exit 1
+    }
     echo "已强制更新：$_old -> $_new"
   }
   if [ "$FORCE_UPDATE" = "1" ]; then

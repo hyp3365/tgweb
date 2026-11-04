@@ -166,11 +166,23 @@ do_update() {
     echo "已经是最新版（$new_sha），不用更新代码，仍会重新安装脚本并重建服务。"
   else
     if [ -n "$(git -C "$APP_DIR" status --porcelain 2>/dev/null | grep -v '^??' || true)" ]; then
-      git -C "$APP_DIR" stash push -m "tg update backup $old_sha" 2>/dev/null || true
-      stashed=1
+      # stash 成功才算暂存住了：原来是 stash push 后面跟 || true，不管成没成
+      # 都把 stashed 标成 1，万一 stash 真失败了，reset 会把本地改动直接丢掉，
+      # 还谎称“已暂存到 git stash”。现在 stash 失败就直接停，改动一点不动。
+      if git -C "$APP_DIR" stash push -m "tg update backup $old_sha" 2>/dev/null; then
+        stashed=1
+      else
+        echo "本地改动暂存失败，停止更新，改动没有动。"
+        return 1
+      fi
     fi
     if ! git -C "$APP_DIR" reset --hard "origin/$branch"; then
-      echo "强制更新失败，服务没动。"
+      # reset 失败时把刚暂存的改动弹回来，才是真的“服务没动”，不然工作区
+      # 已经是干净的旧版，用户的改动只剩在 stash 里，还得自己去找。
+      if [ "$stashed" = "1" ]; then
+        git -C "$APP_DIR" stash pop 2>/dev/null || true
+      fi
+      echo "强制更新失败，本地改动已还原，服务没动。"
       return 1
     fi
     echo "已更新：$old_sha -> $new_sha"
