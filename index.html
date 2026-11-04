@@ -422,59 +422,87 @@ async function openChannelLink(username, msgId){
     if (currentChannelId && currentChannelId !== d.id) pushNavStack();
     await loadChat(d.id, d.title||username, d.username||username);
     if (msgId) await jumpToChatMessage(Number(msgId));
-  }catch(e){ alert(e.message); }
+    return true;
+  }catch(e){
+    // 本页解析失败（私密、用户名不对、请求失败等）也不弹错：是链接就在本页打开，
+    // 直接在当前标签页打开 t.me 原链接，浏览器返回键可以回到 tgweb。
+    location.href = 'https://t.me/' + username + (msgId ? '/' + msgId : '');
+    return false;
+  }
 }
-// 所有 t.me 链接的统一入口：只在本网页里处理，绝不 window.open、新标签页。
-// 文本链接、内联按钮、机器人回调按钮里的 t.me 链接都走这里，非 t.me 的链接不动，
-// 还是原来的新标签页打开。
+// 所有 t.me 链接的统一入口：是链接就在本页打开，绝不 window.open、新标签页，
+// 也不管它是什么路径——不再弹“打不开”或“请求失败”。
+// 文本链接、内联按钮、机器人回调按钮、图片说明里的链接都走这里。
+// 规则：聊天类（用户名、c/、s/、邀请）先在本页 tgweb 里打开对话；
+// 本页打不开（解析/加入/加载失败）时，退到当前标签页打开原链接；
+// 非聊天类（贴纸、分享、代理等）本页没有对话可开，直接在当前标签页打开原链接，
+// 分享/预览类如果带了内嵌的目标链接，就打开那个目标链接。
 async function openTmeLink(url){
+  let u = String(url || '').trim();
+  if (/^t\.me\//i.test(u)) u = 'https://' + u;
+  let parsed;
+  try{ parsed = new URL(u); }catch(e){ return; }
+  if (!/^(www\.)?t\.me$/i.test(parsed.hostname)) { location.href = u; return; }
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  const first = parts[0] || '';
+  const openInPage = (link)=>{ location.href = link; };
   try{
-    let u = String(url || '').trim();
-    if (/^t\.me\//i.test(u)) u = 'https://' + u;
-    const parsed = new URL(u);
-    if (!/^(www\.)?t\.me$/i.test(parsed.hostname)) { alert('不是 t.me 链接：' + url); return; }
-    const parts = parsed.pathname.split('/').filter(Boolean);
-    const first = parts[0] || '';
-    // 邀请链接：本页直接加入并打开，不跳去 Telegram 网页版。
-    // 注意 /+邀请码 是一整个段（"+xyz"），不是单独的 "+" 再加一段，之前写 first === '+' 就漏了它。
-    if (first.startsWith('+') || first === 'joinchat') { joinChannel(u); return; }
-    // 贴纸、主题、分享、代理这类路径根本不是频道/群组，不能当用户名去解析，
-    // 否则会去解析一个叫 addstickers 的“频道”然后报找不到；直接说明打不开，不跳新标签。
-    if (['addstickers', 'addtheme', 'addlist', 'share', 'proxy', 'socks', 'setlanguage'].includes(first)) {
-      alert('这个 t.me 链接在本网页打不开：' + url);
+    // 邀请链接：先在本页直接加入并打开；加入失败就本页打开原邀请链接，不弹错。
+    // 注意 /+邀请码 是一整个段（"+xyz"），不是单独的 "+" 再加一段。
+    if (first.startsWith('+') || first === 'joinchat') {
+      try{
+        const d = await api('/api/join',{method:'POST',body:JSON.stringify({channel:u})});
+        if (d.joined?.id) { joinedIds.add(d.joined.id); await loadChat(d.joined.id, d.joined.title||u, d.joined.username||''); }
+        else loadChannels();
+      }catch(e){ openInPage(u); }
       return;
+    }
+    // 分享、即时预览：内嵌的目标链接才是用户要去的地方；没有内嵌链接就打开原链接。
+    if (first === 'share' || first === 'iv') {
+      const embedded = parsed.searchParams.get('url');
+      if (embedded) {
+        if (isTmeUrl(embedded)) { await openTmeLink(embedded); return; }
+        openInPage(embedded); return;
+      }
+      openInPage(u); return;
     }
     // 私密频道消息链接 t.me/c/频道号/消息号：频道号就是 Telethon 的频道 id（去掉 -100 前缀），
     // 先在全部频道列表里找标题，找不到就用空标题直接按 id 打开，后端按 PeerChannel 兜底。
+    // 本页加载失败就本页打开原链接，不弹错。
     if (first === 'c' && /^\d+$/.test(parts[1] || '')) {
       const cid = Number(parts[1]);
       const mid = parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null;
-      let title = '', username = '';
       try{
-        const d = await api('/api/channels');
-        const found = (d.channels || []).find(c => c.id === cid);
-        if (found) { title = found.title || ''; username = found.username || ''; }
-      }catch(e){}
-      if (currentChannelId && currentChannelId !== cid) pushNavStack();
-      await loadChat(cid, title, username);
-      if (mid) await jumpToChatMessage(mid);
+        let title = '', username = '';
+        try{
+          const d = await api('/api/channels');
+          const found = (d.channels || []).find(c => c.id === cid);
+          if (found) { title = found.title || ''; username = found.username || ''; }
+        }catch(e){}
+        if (currentChannelId && currentChannelId !== cid) pushNavStack();
+        await loadChat(cid, title, username);
+        if (mid) await jumpToChatMessage(mid);
+      }catch(e){ openInPage(u); }
       return;
     }
-    // 公开预览 s/用户名：当成用户名打开，消息号如果有也跳过去。
+    // 公开预览 s/用户名：当成用户名打开，消息号如果有也跳过去；失败时 openChannelLink 已退到本页打开原链接。
     if (first === 's' && parts[1]) {
       await openChannelLink(parts[1], parts[2] && /^\d+$/.test(parts[2]) ? Number(parts[2]) : null);
       return;
     }
-    // 用户名、用户名/消息号：走原来的解析打开。?start= 这类机器人参数在本页打不开，
-    // 只能先打开对话，参数丢掉，总比跳出本网页好。
-    if (/^[A-Za-z0-9_]+$/.test(first)) {
+    // 贴纸、主题、代理等根本不是对话的路径：不浪费一次解析请求，直接本页打开原链接。
+    if (['addstickers', 'addtheme', 'addlist', 'proxy', 'socks', 'setlanguage'].includes(first)) {
+      openInPage(u); return;
+    }
+    // 用户名、用户名/消息号：走原来的解析打开。?start= 这类机器人参数在本页打开对话时丢掉，
+    // 失败时 openChannelLink 已退到本页打开原链接。
+    if (first) {
       await openChannelLink(first, parts[1] && /^\d+$/.test(parts[1]) ? Number(parts[1]) : null);
       return;
     }
-    // 贴纸、分享、代理等其他 t.me 路径：本页没有对应的打开方式，
-    // 也不新标签页打开，直接告诉用户，避免悄悄跳出去。
-    alert('这个 t.me 链接在本网页打不开：' + url);
-  }catch(e){ alert(e.message || ('打不开这个 t.me 链接：' + url)); }
+    // 其他任何路径（贴纸、主题、代理、空路径等）：不再判断、不再弹错，直接本页打开原链接。
+    openInPage(u);
+  }catch(e){ openInPage(u); }
 }
 function highlightChatMessage(el){
   if (!el) return;
@@ -1082,6 +1110,17 @@ function dedupeDateSeps(box){
     else seen = d;
   });
 }
+// 图片消息说明里的第一个链接：点图片本身也要能打开这个链接，
+// 而不是只有点说明文字里的链接才有效。没有链接的图片不加点击。
+// 句末标点（。 ， 、 ）等不算进链接里，和 linkify 的规则一致。
+function firstLinkInText(t){
+  const m = String(t || '').match(/(?:https?:\/\/)?t\.me\/[^\s<"')\]]+|https?:\/\/[^\s<"')\]]+/i);
+  if (!m) return null;
+  let core = m[0].replace(/[.,;:!?，。、；：？！）】」』)\]}]+$/, '');
+  if (!core) return null;
+  if (/^t\.me\//i.test(core)) core = 'https://' + core;
+  return core;
+}
 function chatBubble(m, channelId, usernameOverride){
   // 评论页传 usernameOverride=''：头像/图片地址不带原频道用户名，
   // 后端按讨论组 id 用 PeerChannel 兜底解析，带原频道用户名反而会解析到原频道，拿错消息。
@@ -1089,7 +1128,15 @@ function chatBubble(m, channelId, usernameOverride){
   const unameQ = uname ? `?username=${encodeURIComponent(uname)}` : '';
   let body = '';
   if (m.text) body += `<div>${linkify(esc(m.text)).replace(/\n/g,'<br>')}</div>`;
-  if (m.kind === 'photo') body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${unameQ}"${m.pw && m.ph ? ` width="${m.pw}" height="${m.ph}"` : ''} loading="lazy" alt="">`;
+  if (m.kind === 'photo') {
+    const photoLink = firstLinkInText(m.text || '');
+    const photoClick = photoLink
+      ? (isTmeUrl(photoLink)
+        ? ` style="cursor:pointer" data-url="${esc(photoLink)}" onclick="openTmeLink(this.dataset.url)"`
+        : ` style="cursor:pointer" data-url="${esc(photoLink)}" onclick="location.href=this.dataset.url"`)
+      : '';
+    body += `<img src="${WEB_BASE}/photo/${channelId}/${m.msg_id}${unameQ}"${m.pw && m.ph ? ` width="${m.pw}" height="${m.ph}"` : ''} loading="lazy" alt=""${photoClick}>`;
+  }
   if (m.kind === 'video') {
     const thumb = m.has_thumb
       ? `<img src="${WEB_BASE}/thumb/${channelId}/${m.msg_id}${unameQ}" loading="lazy" alt="" onerror="this.parentElement.innerHTML='<div class=thumb-placeholder>▶</div>'">`
