@@ -103,7 +103,7 @@ a.kb-btn{display:block}
    双击按钮本身还是被双击处理排除的，不会触发快进。
    弹窗底部内边距留 64px 给这个按钮（按钮高约 35px + 离底边 16px + 空隙），
    这样播放器框底边和按钮之间总有空隙，按钮不会压住进度条的时间文字。 */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px;touch-action:none}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:100;padding:4px 4px 64px 4px;touch-action:none;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
 .modal-box{width:100%;max-width:1600px;position:relative}
 /* 单手用手机时：播放器沉到底部附近，进度条就在拇指附近，不用够到屏幕中间去拖。
    只在触屏或窄屏上这样，电脑鼠标能轻松点中间，电脑上还是居中，不会变得很怪。
@@ -124,7 +124,7 @@ a.kb-btn{display:block}
 }
 .seek-feedback{position:absolute;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:#fff;padding:10px 16px;border-radius:20px;font-size:16px;pointer-events:none;opacity:0;transition:opacity .2s;z-index:2}
 .seek-feedback.show{opacity:1}
-.modal-box video{width:100%;max-height:80vh;max-height:80dvh;background:#000;border-radius:12px;touch-action:none}
+.modal-box video{width:100%;max-height:80vh;max-height:80dvh;background:#000;border-radius:12px;touch-action:none;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
 .modal-close{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:101;margin:0;padding:7px 14px;font-size:14px}
 /* 原生进度条去掉：浏览器自带的 controls 是一整套，没法只关其中一条，
    只能用 WebKit 的伪元素把时间轴藏起来，播放/音量/全屏这些按钮还在。
@@ -209,7 +209,6 @@ a.kb-btn{display:block}
   </section>
   <h2>所有频道</h2>
   <div id="channels" class="channels-grid muted">正在加载…</div>
-  <div id="tgwebVersionInfo" class="muted" style="margin-top:16px;font-size:12px">版本 防退出v5 · 历史条目加载中…</div>
 </div>
 
 <!-- 第四步：点击频道进入的新页面：该频道视频 -->
@@ -448,7 +447,6 @@ function tgwebPushState(){
     // 历史条目数就对不上了，下次判断 seq==0 补推也会错。
     return;
   }
-  try{ tgwebUpdateHistInfo(); }catch(e){}
 }
 window.addEventListener('popstate', (e)=>{
   const playerOpen = !document.getElementById('playerModal').classList.contains('hidden');
@@ -494,7 +492,6 @@ window.addEventListener('popstate', (e)=>{
     const isNonRoot = !document.getElementById('commentsView').classList.contains('hidden') || !document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden');
     if (!isNonRoot) tgwebTrapLater();
   }
-  try{ tgwebUpdateHistInfo(); }catch(e){}
 });
 // 延迟补推：popstate 里直接推在 Chrome 上会被忽略，setTimeout 0
 // 也不够——滑动返回的手势动画还没结束，浏览器还在返回过渡里，
@@ -502,21 +499,12 @@ window.addEventListener('popstate', (e)=>{
 // 3 条缓冲滑空，补推在手势里被吞了。所以延迟到 350ms 再推，
 // 手势动画已经结束，浏览器回到正常状态，推才能生效；下一次滑动
 // 至少也是几百毫秒之后，补推一定已经跑完了。一次推 3 条做缓冲。
-// 脚注里的历史条目数就是 history.length，滑一下先减 1，等 350ms
-// 补推完应该再加 3，如果只减不加，就是补推还是没生效。
 let tgwebTrapTimer = null;
-function tgwebUpdateHistInfo(){
-  try{
-    const el = document.getElementById('tgwebVersionInfo');
-    if (el) el.textContent = '版本 防退出v5 · 历史条目 ' + (history.length || 0) + ' · 内部序号 ' + tgwebSeq + ' · ' + ((typeof location !== 'undefined' && location.hash) || '无hash');
-  }catch(e){}
-}
 function tgwebTrapLater(){
   if (tgwebTrapTimer) return;
   tgwebTrapTimer = setTimeout(()=>{
     tgwebTrapTimer = null;
     tgwebPushState(); tgwebPushState(); tgwebPushState();
-    tgwebUpdateHistInfo();
   }, 350);
 }
 // 返回缓存恢复：用户从 tgweb 滑出到上一个网站，再用浏览器前进
@@ -1052,7 +1040,15 @@ function swipeExcluded(target, x, y){
   const r = p.getBoundingClientRect();
   return !!(r.width && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && y > r.bottom - 48);
 }
-// 长按倍速：按住视频 500ms 不动就切到 2x，松手立刻恢复原来倍速。
+// 长按倍速：按住视频 400ms 不动就切到 2x，松手立刻恢复原来倍速。
+// 以前是 500ms，但手机浏览器自己的长按菜单（安卓的下载/保存菜单、
+// iOS 的保存视频呼出）也是 500ms 左右到，菜单一弹就发 pointercancel，
+// 计时还没跑到或者刚切到 2x 就被取消，框内按住就跟没生效一样。
+// 所以三处一起改：计时提前到 400ms，抢在系统菜单之前先切倍速；
+// 播放器框内禁掉系统长按菜单（contextmenu）和 iOS 呼出（上面 CSS
+// 的 -webkit-touch-callout:none），菜单不弹、pointer 就不会被取消；
+// 进度条、关闭按钮、视频底部 48px 原生控制条上还是不启动、不禁菜单，
+// 免得原生进度/音量/全屏被挡住。
 // 和滑动快进共用同一套起点/终点判断，所以长按不会和滑动、双击、
 // 进度条拖动抢：起点在进度条、关闭按钮、视频底部 48px 原生控制条上的
 // 不启动；按住后一动超过 20px 就算滑动、取消长按计时；已经在滑动
@@ -1062,7 +1058,10 @@ let speedPressTimer = null, speedPressActive = false, speedPressOrigRate = 1;
 function startLongPress(){
   if (speedPressTimer || speedPressActive) return;
   const p = document.getElementById('player');
-  if (!p || p.paused) return;
+  if (!p) return;
+  // 起手时先不判 paused：视频还在缓冲、刚点播放还没真正播起来时
+  // paused 还是真，起手就判会直接不计时，框内按住就跟没生效一样；
+  // 真正切倍速时再判一次，那时还在暂停就确实不切，见下面计时回调。
   speedPressTimer = setTimeout(()=>{
     speedPressTimer = null;
     const v = document.getElementById('player');
@@ -1073,7 +1072,7 @@ function startLongPress(){
     speedPressActive = true;
     const f = document.getElementById('seekFeedback');
     if (f) { f.textContent = '2x 倍速'; f.style.left = '50%'; f.classList.add('show'); }
-  }, 500);
+  }, 400);
 }
 function cancelLongPressTimer(){
   if (speedPressTimer) { clearTimeout(speedPressTimer); speedPressTimer = null; }
@@ -1174,6 +1173,13 @@ playerModalEl.addEventListener('touchcancel', e=>{
 playerModalEl.addEventListener('click', e=>{
   if (Date.now() - swipeEndAt < 400) { e.preventDefault(); e.stopPropagation(); }
 }, true);
+// 播放器框内长按不弹系统菜单：不禁的话，安卓长按视频会弹下载/保存
+// 菜单、iOS 会弹保存视频呼出，菜单一弹就发 pointercancel，长按倍速
+// 的计时还没跑完或者刚切到 2x 就被取消，框内按住就跟没生效一样。
+// 进度条、关闭按钮、视频底部 48px 原生控制条上不禁，免得原生操作被挡。
+playerModalEl.addEventListener('contextmenu', e=>{
+  if (!swipeExcluded(e.target, e.clientX, e.clientY)) e.preventDefault();
+});
 document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !document.getElementById('playerModal').classList.contains('hidden')) closePlayerViaBack(); });
 function backToChannelsDirect(){
   closePlayer();
