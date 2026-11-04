@@ -209,6 +209,7 @@ a.kb-btn{display:block}
   </section>
   <h2>所有频道</h2>
   <div id="channels" class="channels-grid muted">正在加载…</div>
+  <div id="tgwebVersionInfo" class="muted" style="margin-top:16px;font-size:12px">版本 防退出v4 · 历史条目加载中…</div>
 </div>
 
 <!-- 第四步：点击频道进入的新页面：该频道视频 -->
@@ -432,6 +433,7 @@ function tgwebPushState(){
   if (tgwebPopping) return;
   tgwebSeq++;
   try{ history.pushState({tgweb:true, seq:tgwebSeq}, ''); }catch(e){}
+  try{ tgwebUpdateHistInfo(); }catch(e){}
 }
 window.addEventListener('popstate', (e)=>{
   const playerOpen = !document.getElementById('playerModal').classList.contains('hidden');
@@ -477,17 +479,28 @@ window.addEventListener('popstate', (e)=>{
     const isNonRoot = !document.getElementById('commentsView').classList.contains('hidden') || !document.getElementById('chatView').classList.contains('hidden') || !document.getElementById('channelView').classList.contains('hidden');
     if (!isNonRoot) tgwebTrapLater();
   }
+  try{ tgwebUpdateHistInfo(); }catch(e){}
 });
 // 延迟补推：popstate 里直接推在 Chrome 上会被忽略，setTimeout 0
-// 让浏览器先完成这次返回再推，下一次滑动前一定已经推好了。
-// 一次推 3 条做缓冲，快速连滑也不会一次滑空。
+// 也不够——滑动返回的手势动画还没结束，浏览器还在返回过渡里，
+// 这时候推同样会被忽略，这就是“更新后还是滑 3 次就退出”的原因：
+// 3 条缓冲滑空，补推在手势里被吞了。所以延迟到 350ms 再推，
+// 手势动画已经结束，浏览器回到正常状态，推才能生效；下一次滑动
+// 至少也是几百毫秒之后，补推一定已经跑完了。一次推 3 条做缓冲。
+// 脚注里的历史条目数就是 history.length，滑一下先减 1，等 350ms
+// 补推完应该再加 3，如果只减不加，就是补推还是没生效。
 let tgwebTrapTimer = null;
+function tgwebUpdateHistInfo(){
+  const el = document.getElementById('tgwebVersionInfo');
+  if (el) el.textContent = '版本 防退出v4 · 历史条目 ' + (history.length || 0) + ' · 内部序号 ' + tgwebSeq;
+}
 function tgwebTrapLater(){
   if (tgwebTrapTimer) return;
   tgwebTrapTimer = setTimeout(()=>{
     tgwebTrapTimer = null;
     tgwebPushState(); tgwebPushState(); tgwebPushState();
-  }, 0);
+    tgwebUpdateHistInfo();
+  }, 350);
 }
 // 返回缓存恢复：用户从 tgweb 滑出到上一个网站，再用浏览器前进
 // 回到 tgweb 时，页面是从返回缓存（bfcache）恢复的，脚本不会重跑，
