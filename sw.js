@@ -437,7 +437,11 @@ async function handleMedia(request) {
       channel: channel, msg: msg, username: username,
       rangeHeader: request.headers.get('range')
     });
-    if (request.method === 'HEAD') return new Response(null, { status: resp.status, headers: resp.headers });
+    if (request.method === 'HEAD') {
+      // 只需要头部：把刚建好的流取消掉，不要白占一条下载（HEAD 不发 body）
+      try { if (resp.body) await resp.body.cancel(); } catch (e) { /* 忽略 */ }
+      return new Response(null, { status: resp.status, headers: resp.headers });
+    }
     return resp;
   } catch (e) {
     // 没登录就不再往下走：页面自己的 /api 调用会 401 并弹密码框
