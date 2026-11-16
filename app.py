@@ -45,9 +45,13 @@ WEB_SESSION_DAYS = 30
 # 看不到 /stream、看不到 206 Partial Content、看不到 video/mp4。
 # 帧大小和 Telethon 的单块 512KB 对齐：拖动进度条时最多多下一个块，不整块重复下。
 ENC_FRAME = 512 * 1024
-# 单次请求的明文上限（开放式 Range bytes=X- 用）：和原来 /stream 的 _RANGE_CAP 一致，
-# 拖动/关播放器时旧请求最多白下这么多，浏览器会自己接着要下一段。
-ENC_CAP = 16 * 1024 * 1024
+# 单次请求的明文上限 = 2MB（正好 4 个 512KB 帧）。
+# 不能开大：走 Cloudflare / Tunnel 时，POST + application/octet-stream 的响应体在边缘会被
+# 检查/缓冲，16MB 要拉几十秒才冲出边缘，浏览器那边一直等不到第一个字节，最后 524 超时——
+# 这正是“显示加密传输但视频卡死播不出”的直接原因。2MB 只要一两秒就能整段送达，
+# 就算中间任何一层把整个响应体缓冲下来也能很快起播；不够的部分 <video> 会自己接着要下一段
+# （后者由 sw.js 按 cap 分段连续拉，播放不受影响）。
+ENC_CAP = 2 * 1024 * 1024
 # auto：默认走加密流，Service Worker 不可用（老 iOS / 无痕）时自动回落明文 /stream；
 # strict：只允许加密流，/stream 直接 403（最严格，但老浏览器就看不了）；
 # off：关掉加密接口，完全回到原来的 /stream 明文行为（只用于排查问题）。
@@ -1654,8 +1658,9 @@ async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_i
 def _blob_resp(kind: str, body=b""):
     # 出错也是 200：Cloudflare 那头看不出哪次是错、哪次是视频，只看到一次空的 octet-stream。
     # 真正的状态放在一个中性响应头里（X-Blob-S），只有我们自己的 Service Worker 会去看。
+    # no-transform：明确禁止 Cloudflare 压缩/改写响应体（压缩会把流式响应整段攒起来再发）。
     return Response(status_code=200, content=body, media_type="application/octet-stream",
-                    headers={"Cache-Control": "private, no-store", "X-Blob-S": kind,
+                    headers={"Cache-Control": "private, no-store, no-transform", "X-Blob-S": kind,
                              "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff"})
 
 
@@ -1751,6 +1756,12 @@ async def blob(request: Request, body: BlobIn):
     frame0 = start // ENC_FRAME
     frame_start = frame0 * ENC_FRAME
     stop = end + 1  # 明文右开边界
+    # 响应体的长度是算得出来的（从帧首到 end，每帧 4 字节长度头），直接给 Content-Length：
+    # 不带 Content-Length 就只能 chunked，Cloudflare 对 chunked 的 POST 响应会等整段攒完
+    # 才转发（起播就卡住），而带确定长度它可以边收边转、也不必要地改写编码。
+    _plain_bytes = stop - frame_start
+    _num_frames = (_plain_bytes + ENC_FRAME - 1) // ENC_FRAME
+    _enc_total = _plain_bytes + 4 * _num_frames
 
     async def gen():
         pos_node = frame_start
@@ -1780,7 +1791,9 @@ async def blob(request: Request, body: BlobIn):
             raise RuntimeError("加密流提前结束")
 
     return StreamingResponse(gen(), media_type="application/octet-stream",
-                             headers={"Cache-Control": "private, no-store", "X-Blob-S": "ok",
+                             headers={"Cache-Control": "private, no-store, no-transform",
+                                      "Content-Length": str(_enc_total),
+                                      "X-Blob-S": "ok",
                                       "X-Blob-Kid": kid, "X-Blob-N": _b64(nf),
                                       "X-Accel-Buffering": "no",
                                       "X-Content-Type-Options": "nosniff"})

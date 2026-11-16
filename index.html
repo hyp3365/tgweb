@@ -1014,6 +1014,8 @@ function closePlayer(){
   try{ endLongPress(); }catch(e){}
   // 关掉时把还没执行的单击（播放/暂停）也取消掉
   try{ clearTimeout(singleTapTimer); singleTapTimer = null; lastTapAt = 0; }catch(e){}
+  // 本次播放的起播超时器也要收掉，不然它会误伤下一个视频（会话号也推一格）。
+  try{ encPlaySession++; clearEncWatch(); }catch(e){}
   p.pause(); p.removeAttribute('src'); p.load();
   document.querySelector('#playerModal .modal-box').classList.remove('portrait-video');
   document.getElementById('playerModal').classList.add('hidden');
@@ -1971,12 +1973,25 @@ let swReady = false;
 let swTried = null;
 let encActive = false;        // 本次播放是不是走的加密流
 let encFallbackDone = false;
-function updateEncBadge(){
+let lastEncErr = '';          // SW 报上来的最近一次加密错误（页面角标上显示）
+let encWatchTimer = null;     // 起播超时保护定时器
+let encPlaySession = 0;       // 播放会话号：旧会话的超时器不能误伤新视频
+function updateEncBadge(note){
   const b = document.getElementById('encBadge');
   if (!b) return;
   b.classList.remove('hidden');
   if (encActive) { b.textContent = '🔒 加密传输'; b.classList.remove('plain'); }
-  else { b.textContent = '⚠ 未加密直连'; b.classList.add('plain'); }
+  else { b.textContent = '⚠ 未加密直连' + (note ? '（' + note + '）' : ''); b.classList.add('plain'); }
+}
+function showEncErr(){
+  const b = document.getElementById('encBadge');
+  if (!b) return;
+  b.classList.remove('hidden');
+  b.classList.add('plain');
+  b.textContent = '⚠ 加密失败' + (lastEncErr ? ': ' + lastEncErr : '');
+}
+function clearEncWatch(){
+  if (encWatchTimer) { clearTimeout(encWatchTimer); encWatchTimer = null; }
 }
 function initEncryptedStream(){
   // 注册 SW 并等它接管本页：没接管就播的话，/media/ 请求会真发到服务器（404）。
@@ -1985,7 +2000,10 @@ function initEncryptedStream(){
   swTried = (async ()=>{
     if (!('serviceWorker' in navigator) || !window.isSecureContext) { swReady = false; return false; }
     try{
-      await navigator.serviceWorker.register(WEB_BASE + '/sw.js', { scope: WEB_BASE + '/' });
+      // updateViaCache: 'none' 让浏览器每次都去服务器问 sw.js 有没有变——服务端 tg update
+      // 之后手机刷新一次就是新版 SW，不会被 HTTP 缓存钉在旧版本上继续卡播。
+      const reg = await navigator.serviceWorker.register(WEB_BASE + '/sw.js', { scope: WEB_BASE + '/', updateViaCache: 'none' });
+      try{ if (reg && typeof reg.update === 'function') reg.update().catch(()=>{}); }catch(e){}
       await navigator.serviceWorker.ready;
       if (!navigator.serviceWorker.controller) {
         await new Promise(res=>{
@@ -2005,19 +2023,29 @@ function initEncryptedStream(){
 }
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('controllerchange', ()=>{ swReady = !!navigator.serviceWorker.controller; });
+  // SW 里播不了的原因报上来了（帧流断开、被 Cloudflare 拦成 HTML、帧长异常……）：
+  // 手机上看不到 SW 控制台，先把原因存着，strict 模式直接贴到角标上。
+  navigator.serviceWorker.addEventListener('message', (ev)=>{
+    const d = ev && ev.data;
+    if (!d || d.type !== 'tgweb-enc-error') return;
+    lastEncErr = (d.code ? '[' + d.code + '] ' : '') + (d.message || '');
+    if (STREAM_MODE === 'strict' && encActive) showEncErr();
+  });
 }
 // 加密流在某些内核上可能根本解不了（或 SW 半路被回收）：auto 模式自动退回明文 /stream，
 // 并在播放器角标上标清楚“未加密直连”；strict 模式不回落，宁可播不了也不明文。
-// 只在“一条都没解出”时回落（readyState 0，连视频头都没拿到）：
-// 播到一半的网络抽风不应该悄悄降级成明文，那种情况交给 <video> 自己重发 Range。
+// 只要还没解出可播的视频帧就回落：readyState 0（连头都没拿到）和 1（只拿到元数据、
+// 拉帧失败，正是 moov 在文件末尾时 Chrome 换个 Range 去拉、结果一个字节都没到的情形）。
+// 已经开始播起来（readyState >= 2）的网络抽风不降级成明文，那种交给 <video> 自己重发 Range。
 document.getElementById('player').addEventListener('error', ()=>{
   if (!encActive || encFallbackDone || STREAM_MODE === 'strict') return;
   const p = document.getElementById('player');
-  if (p.readyState !== 0) return;
+  if (p.readyState >= 2) return;
   const src = p.getAttribute('src') || '';
   if (src.indexOf('/media/') < 0) return;
   encFallbackDone = true;
   encActive = false;
+  clearEncWatch();
   p.src = src.replace('/media/', '/stream/');
   p.play().catch(()=>{});
   updateEncBadge();
@@ -2042,6 +2070,10 @@ async function playVideo(channelId, msgId){
   p.muted = true;
   const q = currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : '';
   encFallbackDone = false;
+  lastEncErr = '';
+  clearEncWatch();
+  encPlaySession++;
+  const session = encPlaySession;
   let useEnc = false;
   if (STREAM_MODE !== 'off') useEnc = await initEncryptedStream();
   // 等 SW 接管这一两百毫秒里，用户可能已经按返回/× 把播放器关了（播放器自己有一个历史条目，
@@ -2050,6 +2082,25 @@ async function playVideo(channelId, msgId){
   if (useEnc) {
     encActive = true;
     p.src = `${WEB_BASE}/media/${channelId}/${msgId}` + q;
+    // 起播超时保护：加密流有时候就是一条字节都解不出来（SW 被换掉、边缘节点把 POST
+    // 拦成了 HTML、服务端重启…），<video> 又不会报错，就这么一直停在就绪态 0～1，
+    // 屏上只有“🔒 加密传输”。等 15 秒还没解出可播帧：auto 模式自动回落明文，
+    // strict 模式不再默默卡死，直接把 SW 报上来的原因贴到角标上。
+    encWatchTimer = setTimeout(()=>{
+      encWatchTimer = null;
+      if (session !== encPlaySession) return;
+      if (!encActive) return;
+      if (document.getElementById('playerModal').classList.contains('hidden')) return;
+      if (p.readyState >= 2) return;
+      if (STREAM_MODE === 'strict') { showEncErr(); return; }
+      const src = p.getAttribute('src') || '';
+      if (src.indexOf('/media/') < 0) { updateEncBadge(); return; }
+      encFallbackDone = true;
+      encActive = false;
+      p.src = src.replace('/media/', '/stream/');
+      p.play().catch(()=>{});
+      updateEncBadge('加密超时已回落');
+    }, 15000);
   } else if (STREAM_MODE === 'strict') {
     encActive = false;
     p.removeAttribute('src'); p.load();

@@ -17,7 +17,8 @@
 
 const ENC_VERSION = 1;
 const DEFAULT_FRAME = 512 * 1024;      // 每帧明文 512KB，和 Telethon 单块对齐
-const DEFAULT_CAP = 16 * 1024 * 1024;  // 开放式 Range（bytes=X-）单次上限，和 app.py 的 ENC_CAP 一致
+const DEFAULT_CAP = 2 * 1024 * 1024;     // 单次请求明文上限（2MB = 4 帧），和 app.py 的 ENC_CAP 一致
+                                         // 大了会被 Cloudflare 边缘缓冲/524，起播就卡死
 const KEY_TTL = 5 * 60 * 1000;         // 会话密钥在 SW 内存里留 5 分钟
 const META_TTL = 60 * 1000;            // 视频大小/mime 缓存 1 分钟
 
@@ -166,8 +167,9 @@ async function getMeta(opts) {
       body: JSON.stringify({ c: o.channel, m: o.msg, u: o.username || null })
     });
     if (!r.ok) {
-      const e = new Error('blob-meta ' + r.status);
-      e.code = r.status === 401 ? 'auth' : 'nf';
+      // 被 Cloudflare 拦下时也可能是一页 HTML：把状态码带出去，页面上能看出是哪一层挂了。
+      const e = new Error('blob-meta http ' + r.status);
+      e.code = r.status === 401 ? 'auth' : (r.status === 404 ? 'nf' : 'http');
       throw e;
     }
     const d = await r.json();
@@ -195,46 +197,114 @@ async function getMeta(opts) {
 }
 
 // 从服务端把 [start, end] 这段明文的帧一个个解出来，按需产出（pull 一次解一帧，天然背压）。
+//
+// 一次 POST 只拿服务端单次上限（cap，默认 2MB）那么多：要的比 cap 多（例如没有 Range 的
+// 整文件 200 请求）就按 cap 一段一段接着要，每一段都是独立的 POST + 独立 nonce，
+// 每段内部从帧首开始解、自己裁掉起点前的字节。
+// 为什么不干脆要一个大段：服务端在 cap 处截断，SW 会把“按上限截断”当成“帧流提前结束”报错，
+// 视频就一直播不出来——这正是旧版 auto 模式卡在 🔒 加密传输的原因之一。
 async function* framePlaintext(ctx) {
-  let keys = await getKeys(ctx);
-  const F = keys.frame;
-  const frame0 = Math.floor(ctx.start / F);
-  let pos = frame0 * F;                       // 当前帧在文件里的明文起点（16 的倍数）
-  let skip = ctx.start - pos;                 // 第一帧前面要裁掉的字节（起点没有 16 对齐时 > 0）
-  const want = ctx.end - ctx.start + 1;
-  const body = JSON.stringify({ c: ctx.channel, m: ctx.msg, u: ctx.username || null, o: ctx.start, e: ctx.end });
+  // keys 放在一个可变盒子里：某一段发现服务端换了密钥（重启）时会就地刷新，后面的段跟着用新的。
+  const state = { keys: await getKeys(ctx) };
+  let cur = ctx.start;
+  while (cur <= ctx.end) {
+    const F = (state.keys && state.keys.frame) || DEFAULT_FRAME;
+    let segEnd = Math.min(ctx.end, cur + ((state.keys && state.keys.cap) || DEFAULT_CAP) - 1);
+    // 段尾尽量落在帧边界上：下一段正好从帧首开始，不会把同一帧重复下一遍
+    if (segEnd < ctx.end) {
+      const aligned = Math.floor((segEnd + 1) / F) * F - 1;
+      if (aligned >= cur) segEnd = aligned;
+    }
+    const want = segEnd - cur + 1;
+    let produced = 0;
+    for await (const chunk of segmentPlaintext(ctx, state, cur, segEnd)) {
+      produced += chunk.length;
+      yield chunk;
+    }
+    if (produced < want) throw new Error('加密帧流提前结束');
+    cur = segEnd + 1;
+  }
+}
+
+function blobInit(ctx, body) {
+  const init = {
+    method: 'POST', credentials: 'same-origin', cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' }, body: body
+  };
+  // 浏览器取消这条响应时，这个 signal 会把还没下载完的 POST 一起掐掉
+  if (ctx.signal) init.signal = ctx.signal;
+  return init;
+}
+
+function abortError() {
+  const e = new Error('已取消');
+  e.code = 'abort';
+  return e;
+}
+
+// 一段（不超过 cap）的明文：一次 POST /api/blob，边读边解边 yield。
+async function* segmentPlaintext(ctx, state, start, end) {
+  const want = end - start + 1;
+  const body = JSON.stringify({ c: ctx.channel, m: ctx.msg, u: ctx.username || null, o: start, e: end });
   let resp = null;
   for (let attempt = 0; ; attempt++) {
-    resp = await ctx.fetchImpl(ctx.base + '/api/blob', {
-      method: 'POST', credentials: 'same-origin', cache: 'no-store',
-      headers: { 'Content-Type': 'application/json' }, body: body
-    });
-    const st = resp.headers.get('X-Blob-S');
-    const kid = resp.headers.get('X-Blob-Kid');
+    let r;
+    try {
+      r = await ctx.fetchImpl(ctx.base + '/api/blob', blobInit(ctx, body));
+    } catch (e) {
+      if (ctx.signal && ctx.signal.aborted) throw abortError();
+      const err = new Error('blob 请求失败：' + String((e && e.message) || e));
+      err.code = 'net';
+      throw err;
+    }
+    const st = r.headers.get('X-Blob-S');
+    const kid = r.headers.get('X-Blob-Kid');
     // 服务端重启过（密钥换了）：重新取一次密钥再开一次，不用让用户重进页面
-    if (kid && kid !== keys.kid && attempt === 0) {
-      try { await resp.body.cancel(); } catch (e) { /* 忽略 */ }
-      keys = await getKeys({ base: ctx.base, fetchImpl: ctx.fetchImpl, force: true });
+    if (kid && kid !== state.keys.kid && attempt === 0) {
+      try { await r.body.cancel(); } catch (e) { /* 忽略 */ }
+      state.keys = await getKeys({ base: ctx.base, fetchImpl: ctx.fetchImpl, force: true });
       continue;
     }
-    if (st && st !== 'ok') {
-      try { await resp.body.cancel(); } catch (e) { /* 忽略 */ }
-      const e = new Error('blob ' + st);
-      e.code = st === 'auth' ? 'auth' : 'nf';
-      throw e;
+    // 光看 X-Blob-S 不够：被 Cloudflare 拦下时拿到的是 502/524 的 HTML 页或质询页，
+    // 既不是 200 也没有 X-Blob-S。绝不能把那种 HTML 当成 4 字节帧长去解析（会解出天量垃圾）。
+    if (!r.ok || !st) {
+      try { await r.body.cancel(); } catch (e) { /* 忽略 */ }
+      const err = new Error('blob http ' + r.status + (st ? ' ' + st : ' 无 X-Blob-S'));
+      err.code = r.status === 401 ? 'auth' : 'http';
+      throw err;
     }
+    if (st !== 'ok') {
+      try { await r.body.cancel(); } catch (e) { /* 忽略 */ }
+      const err = new Error('blob ' + st);
+      err.code = st === 'auth' ? 'auth' : 'nf';
+      throw err;
+    }
+    resp = r;
     break;
   }
   if (!resp.body) throw new Error('blob 没有响应体');
+  const keys = state.keys;
+  const F = keys.frame || DEFAULT_FRAME;
   // 本次响应的 nonce（服务端每次随机给一个，跟着响应头走）：AES-CTR 绝对不能复用 keystream
   const nHeader = resp.headers.get('X-Blob-N');
-  const nonce = nHeader ? b64ToBytes(nHeader) : (keys.nf || new Uint8Array(8));
+  const nonce = nHeader ? b64ToBytes(nHeader) : new Uint8Array(8);
+  const frame0 = Math.floor(start / F);
+  let pos = frame0 * F;                       // 当前帧在文件里的明文起点（16 的倍数）
+  let skip = start - pos;                     // 第一帧前面要裁掉的字节（起点没有 16 对齐时 > 0）
   const reader = resp.body.getReader();
   let carry = new Uint8Array(0);
+  function aborted() { return !!(ctx.signal && ctx.signal.aborted); }
   // 从流里精确取 n 个字节（跨 chunk 拼），取不够说明连接提前断了
   async function take(n) {
     while (carry.length < n) {
-      const r = await reader.read();
+      if (aborted()) throw abortError();
+      let r;
+      try {
+        r = await reader.read();
+      } catch (e) {
+        if (aborted()) throw abortError();
+        throw e;
+      }
       if (r.done) throw new Error('加密帧流提前结束');
       const v = r.value || new Uint8Array(0);
       carry = carry.length ? concatBytes(carry, v) : new Uint8Array(v);
@@ -290,8 +360,15 @@ async function buildMediaResponse(opts) {
   }
   const ctx = {
     base: base, fetchImpl: doFetch, channel: o.channel, msg: o.msg, username: o.username,
-    start: rg.start, end: rg.end
+    start: rg.start, end: rg.end, signal: null
   };
+  // 真实浏览器会主动取消这条流（Chrome 读完 moov 就取消、拖进度条、关掉播放器），
+  // 取消时得把还没下完的那个 POST /api/blob 一起 abort：否则旧请求会一直占着服务端的
+  // _download_sem 并发槽，连开几个视频就把名额占完，后面全部卡死。
+  let abortCtrl = null;
+  if (typeof AbortController === 'function') {
+    try { abortCtrl = new AbortController(); ctx.signal = abortCtrl.signal; } catch (e) { abortCtrl = null; }
+  }
   const gen = framePlaintext(ctx);
   const stream = new ReadableStream({
     async pull(controller) {
@@ -300,11 +377,17 @@ async function buildMediaResponse(opts) {
         if (r.done) controller.close();
         else controller.enqueue(r.value);
       } catch (e) {
-        controller.error(e);
+        try { controller.error(e); } catch (e2) { /* 流已经关掉了 */ }
       }
     },
     cancel() {
-      try { gen.return(); } catch (e) { /* 忽略 */ }
+      if (abortCtrl) { try { abortCtrl.abort(); } catch (e) { /* 忽略 */ } }
+      try {
+        const p = gen.return();
+        // 正在等的 reader.read() 会因为 abort 而以 AbortError 结束，那个异常会落在
+        // 这次 return 的 promise 上；有人接住它，就不会变成未处理的 rejection。
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (e) { /* 忽略 */ }
     }
   }, { highWaterMark: 4 });   // 队列里最多 4 帧（约 2MB），再多就等 <video> 取走，内存不会涨
   const headers = {
@@ -326,6 +409,20 @@ function resetCaches() {
   metaCache.clear();
 }
 
+// 把“为什么播不出来”告诉页面：SW 控制台在手机上看不到，页面才能把原因显示出来。
+function notifyPage(code, message) {
+  try {
+    if (typeof self === 'undefined' || !self.clients || typeof self.clients.matchAll !== 'function') return;
+    const p = self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (!p || typeof p.then !== 'function') return;
+    p.then(function (list) {
+      (list || []).forEach(function (c) {
+        try { c.postMessage({ type: 'tgweb-enc-error', code: code, message: message }); } catch (e) { /* 忽略 */ }
+      });
+    }).catch(function () { /* 忽略 */ });
+  } catch (e) { /* 忽略 */ }
+}
+
 // ---------- Service Worker 接线 ----------
 async function handleMedia(request) {
   const url = new URL(request.url);
@@ -345,7 +442,10 @@ async function handleMedia(request) {
   } catch (e) {
     // 没登录就不再往下走：页面自己的 /api 调用会 401 并弹密码框
     if (e && e.code === 'auth') return new Response('', { status: 401 });
-    return new Response('', { status: 502 });
+    const code = String((e && e.code) || 'err');
+    const message = String((e && e.message) || e);
+    notifyPage(code, message);
+    return new Response('', { status: 502, headers: { 'X-Tgweb-Err': code } });
   }
 }
 
@@ -384,6 +484,9 @@ if (typeof module !== 'undefined' && module.exports) {
     getMeta: getMeta,
     buildMediaResponse: buildMediaResponse,
     framePlaintext: framePlaintext,
+    segmentPlaintext: segmentPlaintext,
+    handleMedia: handleMedia,
+    notifyPage: notifyPage,
     resetCaches: resetCaches
   };
 }
