@@ -143,7 +143,15 @@ a.kb-btn{display:block}
 .player-progress-played{position:absolute;left:0;top:0;height:100%;background:#fff;border-radius:3px;width:0%}
 .player-progress-thumb{position:absolute;top:50%;left:0%;width:14px;height:14px;background:#fff;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}
 .player-progress-time{display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-top:2px}
-.enc-badge{position:absolute;top:8px;right:8px;font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(0,0,0,.55);color:#8fe3a2;pointer-events:none;letter-spacing:.5px}
+/* 加密角标：贴屏幕最右上角，不压视频画面。
+   一个坑：手机竖屏下 .modal-box 带 transform:translateY(...)，而 transform 会让它变成
+   position:fixed 的包含块——角标留在 .modal-box 里，fixed 也只相对那个框定位，照样盖在画面上。
+   所以 HTML 里把 #encBadge 挪到 #playerModal 下、和 .modal-box 同级，fixed 才是真正的屏幕坐标：
+   横屏视频上方有黑边，角标正落在黑边里，完全不挡画面；竖屏高视频就贴屏幕右上角边缘。
+   env(safe-area-inset-top) 避开刘海/状态栏。黑底和内边距都去掉，字号缩到 10px，
+   只留浅绿字 + 一层淡阴影，白底/亮画面上也还看得清。
+   top 先写 4px 兜底：极老的 WebView 不认 env()，整条 calc 会被丢掉，没有兜底角标会站错位置。 */
+.enc-badge{position:fixed;top:4px;top:calc(4px + env(safe-area-inset-top, 0px));right:8px;z-index:102;background:transparent;padding:0;border-radius:0;font-size:10px;line-height:1.2;color:#8fe3a2;opacity:.82;letter-spacing:.2px;text-shadow:0 1px 2px rgba(0,0,0,.9);pointer-events:none}
 .enc-badge.plain{color:#ffcf6b}
 </style></head><body>
 
@@ -288,9 +296,6 @@ a.kb-btn{display:block}
 <div id="playerModal" class="hidden modal">
   <div class="modal-box">
     <video id="player" controls preload="metadata"></video>
-    <!-- 初始状态绝不能写“🔒 加密传输”：那会让播放器卡住时屏上挂着一个假结论。
-         先隐藏，等 playVideo 拿到 useEnc 后由 updateEncBadge() 写准确结果。 -->
-    <div id="encBadge" class="enc-badge hidden"></div>
     <div id="playerProgress" class="player-progress">
       <div id="playerProgressTrack" class="player-progress-track">
         <div class="player-progress-bar">
@@ -303,6 +308,11 @@ a.kb-btn{display:block}
     </div>
     <div id="seekFeedback" class="seek-feedback"></div>
   </div>
+  <!-- 加密角标放在 .modal-box 外面（和它同级）：竖屏时 .modal-box 有 transform，
+       在里面设 position:fixed 会被那个 transform 困在视频框内，照样盖住画面。
+       初始状态绝不能写“🔒 加密传输”：那会让播放器卡住时屏上挂着一个假结论。
+       先隐藏，等 playVideo 拿到 useEnc 后由 updateEncBadge() 写准确结果。 -->
+  <div id="encBadge" class="enc-badge hidden"></div>
   <button class="modal-close" onclick="closePlayerViaBack()">× 关闭</button>
 </div>
 
