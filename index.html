@@ -288,7 +288,9 @@ a.kb-btn{display:block}
 <div id="playerModal" class="hidden modal">
   <div class="modal-box">
     <video id="player" controls preload="metadata"></video>
-    <div id="encBadge" class="enc-badge">🔒 加密传输</div>
+    <!-- 初始状态绝不能写“🔒 加密传输”：那会让播放器卡住时屏上挂着一个假结论。
+         先隐藏，等 playVideo 拿到 useEnc 后由 updateEncBadge() 写准确结果。 -->
+    <div id="encBadge" class="enc-badge hidden"></div>
     <div id="playerProgress" class="player-progress">
       <div id="playerProgressTrack" class="player-progress-track">
         <div class="player-progress-bar">
@@ -1971,6 +1973,8 @@ async function clickInlineBtn(channelId, msgId, row, col){
 let STREAM_MODE = 'auto';
 let swReady = false;
 let swTried = null;
+let swGiveUp = false;         // 已经等超时过一次：后面的播放不再每次都白等 2.5 秒
+const SW_WAIT_MS = 2500;      // SW 初始化（register + ready + 接管）的硬上限，超时按不可用处理
 let encActive = false;        // 本次播放是不是走的加密流
 let encFallbackDone = false;
 let lastEncErr = '';          // SW 报上来的最近一次加密错误（页面角标上显示）
@@ -1994,11 +1998,33 @@ function clearEncWatch(){
   if (encWatchTimer) { clearTimeout(encWatchTimer); encWatchTimer = null; }
 }
 function initEncryptedStream(){
-  // 注册 SW 并等它接管本页：没接管就播的话，/media/ 请求会真发到服务器（404）。
-  // skipWaiting + clients.claim 让第一次打开也能马上接管，正常一两百毫秒。
-  if (swTried) return swTried;
-  swTried = (async ()=>{
-    if (!('serviceWorker' in navigator) || !window.isSecureContext) { swReady = false; return false; }
+  // 没接管就播的话，/media/ 请求会真发到服务器（404），所以要么等它接管，要么走明文。
+  //
+  // 双保险 1：地址栏停在 /<WEB_PATH>（没有末尾斜杠）时，这条 URL 不在 SW 的 scope
+  // /<WEB_PATH>/ 里，navigator.serviceWorker.ready 按规范永远不会 resolve。
+  // 这里直接跳到带斜杠的地址（服务端也会 302，但前端不能指望那一下一定发生）。
+  if (WEB_BASE && window.location.pathname === WEB_BASE) {
+    window.location.replace(WEB_BASE + '/' + window.location.search + window.location.hash);
+    return Promise.resolve(false);
+  }
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+    swReady = false;
+    lastEncErr = 'Service Worker 不可用';
+    return Promise.resolve(false);
+  }
+  // 已经被 SW 接管：立刻放行开播，register/update 只丢到后台跑。
+  // 这条捷径很关键——有的机器上 sw.js 请求已经出去了（服务端日志 200），ready 却再也不落地，
+  // 播放器连一条 /media/ 都没发出去。被接管中的页面本来就不需要再等 ready。
+  if (navigator.serviceWorker.controller) {
+    swReady = true;
+    try{
+      const p = navigator.serviceWorker.register(WEB_BASE + '/sw.js', { scope: WEB_BASE + '/', updateViaCache: 'none' });
+      p.then(reg=>{ try{ if (reg && typeof reg.update === 'function') reg.update().catch(()=>{}); }catch(e){} }).catch(()=>{});
+    }catch(e){}
+    return Promise.resolve(true);
+  }
+  // 还没被接管：注册并等接管。整段有硬超时（见下），超时就当 SW 不可用，立刻明文起播。
+  if (!swTried) swTried = (async ()=>{
     try{
       // updateViaCache: 'none' 让浏览器每次都去服务器问 sw.js 有没有变——服务端 tg update
       // 之后手机刷新一次就是新版 SW，不会被 HTTP 缓存钉在旧版本上继续卡播。
@@ -2009,17 +2035,27 @@ function initEncryptedStream(){
         await new Promise(res=>{
           let done = false;
           const finish = ()=>{ if (done) return; done = true; clearTimeout(timer); navigator.serviceWorker.removeEventListener('controllerchange', finish); res(); };
-          const timer = setTimeout(finish, 2500);
+          const timer = setTimeout(finish, 2000);
           navigator.serviceWorker.addEventListener('controllerchange', finish);
         });
       }
       swReady = !!navigator.serviceWorker.controller;
+      if (!swReady) lastEncErr = 'SW 未接管本页';
     }catch(e){
       swReady = false;
+      lastEncErr = 'SW 注册/安装失败';
     }
     return swReady;
   })();
-  return swTried;
+  // 硬超时：register / ready 在某些内核、WebView、无痕环境里会永久挂住，
+  // 绝不能让它把 playVideo 一起拖死（那正是“点开播放器 15 秒什么都不加载”的原因）。
+  // 超时按 SW 不可用处理，立刻走明文 /stream；swTried 留着，后面真接管了下次播放还用得上。
+  // 已经超时过一次就不再重复白等（同一个页面里 register 挂住就是挂住了），直接明文开播。
+  if (swGiveUp) { lastEncErr = 'SW初始化超时'; return Promise.resolve(false); }
+  return Promise.race([
+    swTried,
+    new Promise(res=>{ setTimeout(()=>{ swGiveUp = true; lastEncErr = 'SW初始化超时'; res(false); }, SW_WAIT_MS); })
+  ]);
 }
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('controllerchange', ()=>{ swReady = !!navigator.serviceWorker.controller; });
@@ -2075,7 +2111,14 @@ async function playVideo(channelId, msgId){
   encPlaySession++;
   const session = encPlaySession;
   let useEnc = false;
-  if (STREAM_MODE !== 'off') useEnc = await initEncryptedStream();
+  let fallbackNote = '';
+  if (STREAM_MODE !== 'off') {
+    // 等 SW 这一两秒里，先摆“正在检测”，不要提前显示“🔒 加密传输”这种还没兑现的结论；
+    // 拿到 useEnc 后由下面的 updateEncBadge() 精确切成加密 / 直连。
+    const b0 = document.getElementById('encBadge');
+    if (b0) { b0.classList.remove('hidden'); b0.classList.remove('plain'); b0.textContent = '检测加密通道…'; }
+    useEnc = await initEncryptedStream();
+  }
   // 等 SW 接管这一两百毫秒里，用户可能已经按返回/× 把播放器关了（播放器自己有一个历史条目，
   // 按返回只会关播放器、页面不跳走）：这时不能再设 src，否则关掉的播放器会在后台出声。
   if (document.getElementById('playerModal').classList.contains('hidden')) return;
@@ -2104,15 +2147,17 @@ async function playVideo(channelId, msgId){
   } else if (STREAM_MODE === 'strict') {
     encActive = false;
     p.removeAttribute('src'); p.load();
-    updateEncBadge();
+    if (lastEncErr) showEncErr(); else updateEncBadge();
     alert('这个浏览器用不了 Service Worker（无痕模式、部分内置浏览器会这样），服务器设成了只走加密流，已拒绝明文播放。请换 Chrome / Edge 或关掉无痕再试。');
     return;
   } else {
+    // 没走加密就得把原因讲清楚（例：SW初始化超时），不能默默显示成“正常的未加密直连”
     encActive = false;
+    fallbackNote = lastEncErr;
     p.src = `${WEB_BASE}/stream/${channelId}/${msgId}` + q;
   }
   updatePlayerProgress();
-  updateEncBadge();
+  updateEncBadge(fallbackNote);
   p.play().catch(()=>{});
 }
 // 播放时先判断视频尺寸：元数据一到就看 videoHeight 和 videoWidth，

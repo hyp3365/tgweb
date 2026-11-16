@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.errors import FileReferenceExpiredError, FloodWaitError, SessionPasswordNeededError
@@ -185,6 +185,14 @@ async def _security_headers(request, call_next):
     if WEB_PATH:
         raw = request.scope.get("path", "")
         prefix = "/" + WEB_PATH
+        # 关键：/<WEB_PATH> 不带末尾斜杠时，页面在 SW 的 scope /<WEB_PATH>/ 之外，
+        # navigator.serviceWorker.ready 永远不 resolve，前端 initEncryptedStream() 永久挂住，
+        # 播放器连 p.src 都设不上（表现为点开播放器什么都不加载）。
+        # 所以 GET/HEAD 访问 /<WEB_PATH> 一律 302 到 /<WEB_PATH>/[?query]，把地址栏钉在 scope 内；
+        # 接口和静态路径都在 prefix + "/" 之后，不受影响。
+        if raw == prefix and request.method in ("GET", "HEAD"):
+            query = request.url.query
+            return RedirectResponse(url=prefix + "/" + (("?" + query) if query else ""), status_code=302)
         if raw == prefix or raw.startswith(prefix + "/"):
             rest = raw[len(prefix):] or "/"
             request.scope["path"] = rest
@@ -1806,6 +1814,10 @@ async def service_worker():
     resp = FileResponse("sw.js", media_type="application/javascript")
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    # 允许这个 SW 声明到根作用域（默认只能最宽到脚本所在目录 /<WEB_PATH>/）。
+    # 浏览器只会按页面里 register() 传的 scope 注册，加上这个头不会自己扩大控制范围，
+    # 但能避免个别内核/反代组合下因 scope 校验失败而注册不上。
+    resp.headers["Service-Worker-Allowed"] = "/"
     return resp
 
 
