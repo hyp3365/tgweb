@@ -143,6 +143,8 @@ a.kb-btn{display:block}
 .player-progress-played{position:absolute;left:0;top:0;height:100%;background:#fff;border-radius:3px;width:0%}
 .player-progress-thumb{position:absolute;top:50%;left:0%;width:14px;height:14px;background:#fff;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}
 .player-progress-time{display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-top:2px}
+.enc-badge{position:absolute;top:8px;right:8px;font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(0,0,0,.55);color:#8fe3a2;pointer-events:none;letter-spacing:.5px}
+.enc-badge.plain{color:#ffcf6b}
 </style></head><body>
 
 <!-- 第一步：网页密码，全黑居中登录框 -->
@@ -286,6 +288,7 @@ a.kb-btn{display:block}
 <div id="playerModal" class="hidden modal">
   <div class="modal-box">
     <video id="player" controls preload="metadata"></video>
+    <div id="encBadge" class="enc-badge">🔒 加密传输</div>
     <div id="playerProgress" class="player-progress">
       <div id="playerProgressTrack" class="player-progress-track">
         <div class="player-progress-bar">
@@ -735,6 +738,8 @@ async function refreshStatus(){
   showView('checkingView');
   try{
     const s = await api('/api/status');
+    if (s.enc && s.enc.mode) STREAM_MODE = s.enc.mode;
+    if (STREAM_MODE !== 'off') initEncryptedStream();
     document.getElementById('logoutBtn').classList.toggle('hidden', !s.logged_in);
     if (!s.configured) {
       document.getElementById('status').textContent = '服务器还没配置凭证，请先在服务器上用 tg 命令配置';
@@ -1015,6 +1020,7 @@ function closePlayer(){
   document.body.style.overflow = '';
   playerDragging = false;
   playerHistoryPushed = false;
+  encActive = false;
   updatePlayerProgress();
 }
 function closePlayerViaBack(){
@@ -1953,7 +1959,70 @@ async function clickInlineBtn(channelId, msgId, row, col){
     }, 800);
   }catch(e){ alert(e.message); }
 }
-function playVideo(channelId, msgId){
+// ---------- 加密流（Service Worker 本地解密）----------
+// 播放链路：<video src=/media/...> 由 Service Worker 拦住，真正上网的是 /api/blob 的加密帧，
+// 浏览器在本地用 WebCrypto 解密。Cloudflare 只看得到 200 + application/octet-stream，
+// 看不到 /stream、206 Partial Content 和 video/mp4。
+// STREAM_MODE 由服务端 TG_STREAM_ENC 决定：
+//   auto（默认）能用 SW 就加密，不能用就明文回退；
+//   strict 只准加密，SW 不可用就拒绝播放；   off 完全回到原来的 /stream。
+let STREAM_MODE = 'auto';
+let swReady = false;
+let swTried = null;
+let encActive = false;        // 本次播放是不是走的加密流
+let encFallbackDone = false;
+function updateEncBadge(){
+  const b = document.getElementById('encBadge');
+  if (!b) return;
+  b.classList.remove('hidden');
+  if (encActive) { b.textContent = '🔒 加密传输'; b.classList.remove('plain'); }
+  else { b.textContent = '⚠ 未加密直连'; b.classList.add('plain'); }
+}
+function initEncryptedStream(){
+  // 注册 SW 并等它接管本页：没接管就播的话，/media/ 请求会真发到服务器（404）。
+  // skipWaiting + clients.claim 让第一次打开也能马上接管，正常一两百毫秒。
+  if (swTried) return swTried;
+  swTried = (async ()=>{
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) { swReady = false; return false; }
+    try{
+      await navigator.serviceWorker.register(WEB_BASE + '/sw.js', { scope: WEB_BASE + '/' });
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await new Promise(res=>{
+          let done = false;
+          const finish = ()=>{ if (done) return; done = true; clearTimeout(timer); navigator.serviceWorker.removeEventListener('controllerchange', finish); res(); };
+          const timer = setTimeout(finish, 2500);
+          navigator.serviceWorker.addEventListener('controllerchange', finish);
+        });
+      }
+      swReady = !!navigator.serviceWorker.controller;
+    }catch(e){
+      swReady = false;
+    }
+    return swReady;
+  })();
+  return swTried;
+}
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('controllerchange', ()=>{ swReady = !!navigator.serviceWorker.controller; });
+}
+// 加密流在某些内核上可能根本解不了（或 SW 半路被回收）：auto 模式自动退回明文 /stream，
+// 并在播放器角标上标清楚“未加密直连”；strict 模式不回落，宁可播不了也不明文。
+// 只在“一条都没解出”时回落（readyState 0，连视频头都没拿到）：
+// 播到一半的网络抽风不应该悄悄降级成明文，那种情况交给 <video> 自己重发 Range。
+document.getElementById('player').addEventListener('error', ()=>{
+  if (!encActive || encFallbackDone || STREAM_MODE === 'strict') return;
+  const p = document.getElementById('player');
+  if (p.readyState !== 0) return;
+  const src = p.getAttribute('src') || '';
+  if (src.indexOf('/media/') < 0) return;
+  encFallbackDone = true;
+  encActive = false;
+  p.src = src.replace('/media/', '/stream/');
+  p.play().catch(()=>{});
+  updateEncBadge();
+});
+async function playVideo(channelId, msgId){
   // 只弹出播放器，不滚动页面、不移动列表位置
   const p = document.getElementById('player');
   // 播放器自己占一个历史条目：返回时先弹回这个条目、只关播放器，
@@ -1971,8 +2040,29 @@ function playVideo(channelId, msgId){
   document.querySelector('#playerModal .modal-box').classList.remove('portrait-video');
   // 进入播放器默认静音，上下滑动调音量（上滑取消静音并调大），原生控制条的喇叭也能点开
   p.muted = true;
-  p.src = `${WEB_BASE}/stream/${channelId}/${msgId}` + (currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : ''); p.play().catch(()=>{});
+  const q = currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : '';
+  encFallbackDone = false;
+  let useEnc = false;
+  if (STREAM_MODE !== 'off') useEnc = await initEncryptedStream();
+  // 等 SW 接管这一两百毫秒里，用户可能已经按返回/× 把播放器关了（播放器自己有一个历史条目，
+  // 按返回只会关播放器、页面不跳走）：这时不能再设 src，否则关掉的播放器会在后台出声。
+  if (document.getElementById('playerModal').classList.contains('hidden')) return;
+  if (useEnc) {
+    encActive = true;
+    p.src = `${WEB_BASE}/media/${channelId}/${msgId}` + q;
+  } else if (STREAM_MODE === 'strict') {
+    encActive = false;
+    p.removeAttribute('src'); p.load();
+    updateEncBadge();
+    alert('这个浏览器用不了 Service Worker（无痕模式、部分内置浏览器会这样），服务器设成了只走加密流，已拒绝明文播放。请换 Chrome / Edge 或关掉无痕再试。');
+    return;
+  } else {
+    encActive = false;
+    p.src = `${WEB_BASE}/stream/${channelId}/${msgId}` + q;
+  }
   updatePlayerProgress();
+  updateEncBadge();
+  p.play().catch(()=>{});
 }
 // 播放时先判断视频尺寸：元数据一到就看 videoHeight 和 videoWidth，
 // 高大于宽就是竖屏，给框加 portrait-video 类走贴底不动；横屏和正方形不加，

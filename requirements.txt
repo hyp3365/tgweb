@@ -5,3 +5,6 @@ fastapi>=0.110,<1
 uvicorn[standard]>=0.29,<1
 telethon>=1.36,<2
 cryptg
+# 加密流用的 AES-CTR（app.py 的 _ctr_xor）。python:3.12-slim 上装的是 manylinux 轮子，
+# 不需要 gcc / libssl-dev，构建时间基本不变。版本只封大版本，和上面几条一样。
+cryptography>=42,<51

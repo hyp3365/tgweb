@@ -5,7 +5,11 @@ Telegram 频道视频小网页：登录 / 搜索 / 加频道 / 流式播放
 只给自己用：不要把 9393 端口公开给全网，见 README 的安全一节。
 """
 import asyncio
+import base64
+import hashlib
+import hmac
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -31,6 +35,29 @@ WEB_PATH = os.environ.get("WEB_PATH", "").strip().strip("/")
 if os.environ.get("WEB_PATH_ENABLED", "1").strip().lower() in ("0", "false", "off", "no"):
     WEB_PATH = ""
 WEB_SESSION_DAYS = 30
+
+# ---------- 加密流（application-layer streaming encryption）-----------
+# 视频不再走 /stream 明文（206 + video/mp4），改成：
+#   浏览器 <video src=/media/...>  ->  Service Worker 拦截，改成 POST /api/blob
+#   ->  服务端把视频按帧加密（AES-CTR，每帧独立可解密）推回来（200 + application/octet-stream）
+#   ->  Service Worker 收到一帧立刻解密 enqueue 给 <video>。
+# 这样 Cloudflare 只看到 POST /<路径>/api/blob 200 application/octet-stream 的二进制，
+# 看不到 /stream、看不到 206 Partial Content、看不到 video/mp4。
+# 帧大小和 Telethon 的单块 512KB 对齐：拖动进度条时最多多下一个块，不整块重复下。
+ENC_FRAME = 512 * 1024
+# 单次请求的明文上限（开放式 Range bytes=X- 用）：和原来 /stream 的 _RANGE_CAP 一致，
+# 拖动/关播放器时旧请求最多白下这么多，浏览器会自己接着要下一段。
+ENC_CAP = 16 * 1024 * 1024
+# auto：默认走加密流，Service Worker 不可用（老 iOS / 无痕）时自动回落明文 /stream；
+# strict：只允许加密流，/stream 直接 403（最严格，但老浏览器就看不了）；
+# off：关掉加密接口，完全回到原来的 /stream 明文行为（只用于排查问题）。
+ENC_MODE = (os.environ.get("TG_STREAM_ENC", "auto").strip().lower() or "auto")
+if ENC_MODE not in ("auto", "strict", "off"):
+    ENC_MODE = "auto"
+# 密钥根：可用环境变量 TG_BLOB_SECRET 固定（多实例/重启后想保持同一把密钥时用），
+# 不设就是每次启动随机生成 32 字节——只存在进程内存里，不写磁盘、不进仓库。
+# 网页密码的会话本来也是内存里的，重启后所有人要重新登录，密钥跟着换没有额外代价。
+_ENC_SECRET = (os.environ.get("TG_BLOB_SECRET", "") or "").encode() or secrets.token_bytes(32)
 
 
 def _clamp_parallel(v):
@@ -77,6 +104,74 @@ def _tg_clear(ip):
     _tg_attempts.pop(ip, None)
 _client_lock = asyncio.Lock()
 _entity_lock = asyncio.Lock()
+
+# ---------- 加密流：密钥派生 / 分帧 AES-CTR ----------
+def _hkdf(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    # RFC 5869，只用 SHA-256 一个 PRF，够用且不引依赖
+    prk = hmac.new(salt or b"\x00", ikm, hashlib.sha256).digest()
+    out = b""
+    t = b""
+    i = 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest()
+        out += t
+        i += 1
+    return out[:length]
+
+
+_enc_key_cache: dict = {}
+_ENC_KEY_CACHE_MAX = 200
+
+
+def _enc_keys(token: str):
+    # 每会话一把钥匙：HKDF(根密钥, salt=登录 token, info=用途)。
+    # token 变了（重新登录）钥匙就换，退出登录后旧钥匙再也拿不到（token 已从 _web_sessions 删掉）。
+    if not token:
+        return None
+    hit = _enc_key_cache.get(token)
+    if hit is not None:
+        return hit
+    key = _hkdf(_ENC_SECRET, token.encode(), b"tgweb-blob-v1/key", 32)
+    info = (_hkdf(key, b"", b"tgweb-blob-v1/kid", 8).hex(), key)
+    if len(_enc_key_cache) >= _ENC_KEY_CACHE_MAX:
+        # 会话 token 一换就没人再用了，超上限直接整表清（只影响缓存，不影响正确性）
+        _enc_key_cache.clear()
+    _enc_key_cache[token] = info
+    return info
+
+
+def _ctr_block(nonce8: bytes, block_index: int) -> bytes:
+    # AES-CTR 计数器块：前 8 字节是本次文件（或元数据）固定的 nonce，后 8 字节是大端块号。
+    # 块号 = 明文偏移 // 16，所以任意一段 16 字节对齐的数据都能脱离前面的数据独立加/解密，
+    # 拖动进度条只要知道偏移就能直接算出 counter，不用从头算 keystream。
+    return nonce8 + (block_index & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")
+
+
+def _ctr_xor(data: bytes, key: bytes, nonce8: bytes, block_index: int) -> bytes:
+    if not data:
+        return b""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    enc = Cipher(algorithms.AES(key), modes.CTR(_ctr_block(nonce8, block_index))).encryptor()
+    return enc.update(data) + enc.finalize()
+
+
+# cryptography 只用来做 AES-CTR：python:3.12-slim 上装的是 manylinux 轮子，不需要 gcc。
+# 以前没引入它是因为用不到；cryptg 虽然也在依赖里，但它没有覆盖所有 CPU 架构的轮子，
+# 不适合当唯一实现。import 放在函数里，cryptography 出任何问题都只影响加密接口，
+# 不会让整个 app（登录/搜索/缩略图）起不来。
+
+
+def _b64(b: bytes) -> str:
+    return base64.b64encode(b).decode()
+
+
+class BlobIn(BaseModel):
+    c: int              # channel_id
+    m: int              # msg_id
+    o: int = 0          # 起始明文偏移（可以是任意值，服务端自己按帧向下取整）
+    e: int | None = None  # 结束明文偏移（含），None 表示到文件末尾
+    u: str | None = None  # 用户名，私密频道解析实体用
+
 
 app = FastAPI(title="app", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -278,8 +373,10 @@ class PasswordIn(BaseModel):
 @app.get("/api/status")
 async def status(request: Request):
     check_web_auth(request)
+    # enc 告诉前端：加密流开关、帧大小、单次上限。前端据此决定 <video> 走 /media/ 还是 /stream。
+    enc = {"mode": ENC_MODE, "frame": ENC_FRAME, "cap": ENC_CAP}
     if not API_ID or not API_HASH:
-        return {"configured": False, "logged_in": False}
+        return {"configured": False, "logged_in": False, "enc": enc}
     try:
         client = await get_client()
         logged_in = await client.is_user_authorized()
@@ -288,9 +385,9 @@ async def status(request: Request):
             u = await client.get_me()
             me = {"id": u.id, "name": (u.first_name or "") + (" " + u.last_name if u.last_name else ""),
                   "username": u.username}
-        return {"configured": True, "logged_in": logged_in, "me": me}
+        return {"configured": True, "logged_in": logged_in, "me": me, "enc": enc}
     except Exception as e:
-        return {"configured": True, "logged_in": False, "error": str(e)}
+        return {"configured": True, "logged_in": False, "error": str(e), "enc": enc}
 
 
 @app.post("/api/login")
@@ -1553,8 +1650,158 @@ async def _parallel_gen(client, media, total, start, end, channel_id=None, msg_i
     return
 
 
+# ---------- 加密流接口：只回 200 + application/octet-stream，没有任何视频特征 ----------
+def _blob_resp(kind: str, body=b""):
+    # 出错也是 200：Cloudflare 那头看不出哪次是错、哪次是视频，只看到一次空的 octet-stream。
+    # 真正的状态放在一个中性响应头里（X-Blob-S），只有我们自己的 Service Worker 会去看。
+    return Response(status_code=200, content=body, media_type="application/octet-stream",
+                    headers={"Cache-Control": "private, no-store", "X-Blob-S": kind,
+                             "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff"})
+
+
+def _enc_ready_or_raise():
+    if ENC_MODE == "off":
+        raise HTTPException(status_code=404, detail="加密流已关闭")
+
+
+@app.post("/api/blob-key")
+async def blob_key(request: Request):
+    # 会话密钥下发给已登录的页面：只给 Service Worker 用，页面 JS 拿不到（两个全局环境隔离）。
+    # 没登录拿不到；换账号/重新登录就换一把；退出登录后旧 token 从 _web_sessions 删掉，
+    # 这个接口直接 401，旧钥匙也就没用了（已在 SW 内存里的那把，服务端重启/改密码后也解不开新流）。
+    _enc_ready_or_raise()
+    check_web_auth(request)
+    token = request.cookies.get("web_token") or ""
+    keys = _enc_keys(token)
+    if keys is None:
+        raise HTTPException(status_code=401, detail="need_web_auth")
+    kid, key = keys
+    # 不下发固定 nonce：nonce 每次响应随机，跟着响应头（帧流）/ JSON（元数据）走。
+    # 同一把会话密钥、同一个视频反复拉，用的也是不同的 keystream，不会出现复用。
+    resp = JSONResponse({"v": 1, "f": ENC_FRAME, "cap": ENC_CAP, "k": _b64(key), "kid": kid})
+    resp.headers["Cache-Control"] = "private, no-store"
+    return resp
+
+
+@app.post("/api/blob-meta")
+async def blob_meta(request: Request, body: BlobIn):
+    # 视频大小和真实 mime 不进网络：用同一把会话密钥加密成一段 base64，SW 解密后才拿到。
+    # 这个接口是普通 JSON 接口（错误还是普通 401/404），它不带任何媒体特征，也不带 206。
+    _enc_ready_or_raise()
+    check_web_auth(request)
+    client = await require_login()
+    token = request.cookies.get("web_token") or ""
+    keys = _enc_keys(token)
+    if keys is None:
+        raise HTTPException(status_code=401, detail="need_web_auth")
+    msg = await _get_message(client, body.c, body.m, body.u)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="找不到这条视频")
+    doc = msg.video or msg.document
+    if doc is None or getattr(doc, "size", None) is None:
+        raise HTTPException(status_code=404, detail="这条消息没有文件")
+    kid, key = keys
+    meta = {"s": int(doc.size), "t": doc.mime_type or "video/mp4", "f": ENC_FRAME}
+    payload = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode()
+    iv = secrets.token_bytes(8)   # 每次响应一个新 nonce，AES-CTR 不能复用 keystream
+    resp = JSONResponse({"v": 1, "iv": _b64(iv), "d": _b64(_ctr_xor(payload, key, iv, 0))})
+    resp.headers["Cache-Control"] = "private, no-store"
+    return resp
+
+
+@app.post("/api/blob")
+async def blob(request: Request, body: BlobIn):
+    # 加密帧流。格式：重复的 [4 字节大端长度][该帧密文]，密文长度 = 该帧明文长度。
+    # 帧 k 的明文是 [k*ENC_FRAME, (k+1)*ENC_FRAME)，counter 块号 = k*ENC_FRAME//16，
+    # 所以 SW 从任意一帧开始都能独立解密，不用从头下。
+    if ENC_MODE == "off":
+        return _blob_resp("off")
+    try:
+        check_web_auth(request)
+    except HTTPException:
+        return _blob_resp("auth")
+    try:
+        client = await require_login()
+    except HTTPException:
+        return _blob_resp("auth")
+    token = request.cookies.get("web_token") or ""
+    keys = _enc_keys(token)
+    if keys is None:
+        return _blob_resp("auth")
+    try:
+        msg = await _get_message(client, body.c, body.m, body.u)
+    except Exception:
+        msg = None
+    if msg is None:
+        return _blob_resp("nf")
+    media = msg.media
+    doc = msg.video or msg.document
+    if media is None or doc is None or not getattr(doc, "size", 0):
+        return _blob_resp("na")
+    total = int(doc.size)
+    kid, key = keys
+    nf = secrets.token_bytes(8)   # 本次响应的文件 nonce：每帧的 counter 都是 nf || 块号
+    # 起点向下取整到帧首（帧首是 512KB 的倍数，所以也是 16 字节的倍数），
+    # SW 用同一个公式算帧号，两边对得上；不对齐的起点由 SW 自己裁掉前面几个字节。
+    start = max(0, min(int(body.o or 0), total - 1))
+    end = total - 1 if body.e is None else int(body.e)
+    end = max(start, min(end, total - 1))
+    # 服务端自己也封顶：SW 正常不会超过 ENC_CAP，万一被手改请求也不会一次拉完整部片
+    end = min(end, start + ENC_CAP - 1)
+    frame0 = start // ENC_FRAME
+    frame_start = frame0 * ENC_FRAME
+    stop = end + 1  # 明文右开边界
+
+    async def gen():
+        pos_node = frame_start
+        need = min(ENC_FRAME, stop - pos_node)
+        buf = bytearray()
+        emitted = 0
+        try:
+            async for piece in _parallel_gen(client, media, total, frame_start, stop - 1,
+                                             channel_id=body.c, msg_id=body.m, username=body.u):
+                buf.extend(piece)
+                while len(buf) >= need and need > 0:
+                    plain = bytes(buf[:need])
+                    del buf[:need]
+                    # pos_node 一定是 16 的倍数（帧首是 512KB 的倍数），可以整块算 counter
+                    ct = _ctr_xor(plain, key, nf, pos_node // 16)
+                    yield len(ct).to_bytes(4, "big") + ct
+                    emitted += len(plain)
+                    pos_node += need
+                    need = min(ENC_FRAME, stop - pos_node)
+                    if need <= 0:
+                        return
+        except asyncio.CancelledError:
+            raise
+        # 少发了（Telegram 没给全、文件被改小）：直接把连接掐掉，SW 那头会按“流不完整”
+        # 认成失败，播放器会重新发 Range 续上，不会像悄悄结束那样被当成播完了。
+        if emitted < stop - frame_start:
+            raise RuntimeError("加密流提前结束")
+
+    return StreamingResponse(gen(), media_type="application/octet-stream",
+                             headers={"Cache-Control": "private, no-store", "X-Blob-S": "ok",
+                                      "X-Blob-Kid": kid, "X-Blob-N": _b64(nf),
+                                      "X-Accel-Buffering": "no",
+                                      "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/sw.js")
+async def service_worker():
+    # Service Worker 必须带 application/javascript 才能注册；no-cache 保证换了 sw.js
+    # 之后浏览器下次打开就拿到新的，不会被长缓存钉在旧版本上。
+    resp = FileResponse("sw.js", media_type="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 @app.get("/stream/{channel_id}/{msg_id}")
 async def stream(request: Request, channel_id: int, msg_id: int, username: str | None = None):
+    # strict 模式：明文 /stream 直接关掉，只允许 Service Worker 解密播放。
+    # 老浏览器（不支持 SW）在这种模式下就看不了，这是有意的取舍。
+    if ENC_MODE == "strict":
+        raise HTTPException(status_code=403, detail="已设置为只走加密流，这个浏览器不支持 Service Worker 播放")
     check_web_auth(request)
     client = await require_login()
     msg = await _get_message(client, channel_id, msg_id, username)
