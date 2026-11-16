@@ -52,12 +52,14 @@ ENC_FRAME = 512 * 1024
 # 就算中间任何一层把整个响应体缓冲下来也能很快起播；不够的部分 <video> 会自己接着要下一段
 # （后者由 sw.js 按 cap 分段连续拉，播放不受影响）。
 ENC_CAP = 2 * 1024 * 1024
-# auto：默认走加密流，Service Worker 不可用（老 iOS / 无痕）时自动回落明文 /stream；
-# strict：只允许加密流，/stream 直接 403（最严格，但老浏览器就看不了）；
+# strict（默认）：只允许加密流，/stream 直接 403（最严格；老浏览器/无痕等没有 Service Worker
+#   的环境就看不了视频，这是有意的取舍，防止任何情况下静默回落明文）；
+# auto：能走加密就走，Service Worker 不可用（老 iOS / 无痕）时自动回落明文 /stream；
 # off：关掉加密接口，完全回到原来的 /stream 明文行为（只用于排查问题）。
-ENC_MODE = (os.environ.get("TG_STREAM_ENC", "auto").strip().lower() or "auto")
+# 用环境变量 TG_STREAM_ENC 显式覆盖；不设、设空或设成非法值都是 strict——默认绝不回落明文。
+ENC_MODE = (os.environ.get("TG_STREAM_ENC", "strict").strip().lower() or "strict")
 if ENC_MODE not in ("auto", "strict", "off"):
-    ENC_MODE = "auto"
+    ENC_MODE = "strict"
 # 密钥根：可用环境变量 TG_BLOB_SECRET 固定（多实例/重启后想保持同一把密钥时用），
 # 不设就是每次启动随机生成 32 字节——只存在进程内存里，不写磁盘、不进仓库。
 # 网页密码的会话本来也是内存里的，重启后所有人要重新登录，密钥跟着换没有额外代价。

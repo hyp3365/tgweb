@@ -1978,9 +1978,10 @@ async function clickInlineBtn(channelId, msgId, row, col){
 // 浏览器在本地用 WebCrypto 解密。Cloudflare 只看得到 200 + application/octet-stream，
 // 看不到 /stream、206 Partial Content 和 video/mp4。
 // STREAM_MODE 由服务端 TG_STREAM_ENC 决定：
-//   auto（默认）能用 SW 就加密，不能用就明文回退；
-//   strict 只准加密，SW 不可用就拒绝播放；   off 完全回到原来的 /stream。
-let STREAM_MODE = 'auto';
+//   strict（默认）只准加密，SW 不可用就拒绝播放；
+//   auto 能用 SW 就加密，不能用就明文回退；   off 完全回到原来的 /stream。
+// 页面初始值与服务端默认保持一致（strict），拿到 /api/status 后再按服务端实际值更新。
+let STREAM_MODE = 'strict';
 let swReady = false;
 let swTried = null;
 let swGiveUp = false;         // 已经等超时过一次：后面的播放不再每次都白等 2.5 秒
