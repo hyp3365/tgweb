@@ -414,6 +414,16 @@ function resetCaches() {
   metaCache.clear();
 }
 
+// 页面发来的消息：目前只有“退出网页登录”一条。
+// 会话密钥只在 SW 里（页面拿不到，也就删不掉），所以退出时只能由页面通知 SW 自己清：
+// 换了账号还留着上一份 keyCache，就会出现“新账号的流拿旧钥匙去解”的情况。
+// 抽成纯函数，Node 测试可以直接喂一个假 event 验缓存是否真的清了。
+function handleSwMessage(event) {
+  if (!event || !event.data || event.data.type !== 'tgweb-logout') return false;
+  resetCaches();
+  return true;
+}
+
 // 把“为什么播不出来”告诉页面：SW 控制台在手机上看不到，页面才能把原因显示出来。
 function notifyPage(code, message) {
   try {
@@ -481,6 +491,10 @@ if (typeof self !== 'undefined' && typeof self.addEventListener === 'function' &
     if (!url.pathname.startsWith(BASE + '/media/')) return;
     event.respondWith(handleMedia(req));
   });
+  // 页面退出网页登录时会 postMessage({type:'tgweb-logout'})：把会话密钥和元数据缓存清掉。
+  self.addEventListener('message', function (event) {
+    handleSwMessage(event);
+  });
 }
 
 // Node 里的自动化测试要直接调这些纯逻辑（浏览器里没有 module，这段会被忽略）
@@ -501,6 +515,7 @@ if (typeof module !== 'undefined' && module.exports) {
     segmentPlaintext: segmentPlaintext,
     handleMedia: handleMedia,
     notifyPage: notifyPage,
-    resetCaches: resetCaches
+    resetCaches: resetCaches,
+    handleSwMessage: handleSwMessage
   };
 }
