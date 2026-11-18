@@ -155,17 +155,18 @@ a.kb-btn{display:block}
 .enc-badge.plain{color:#ffcf6b}
 </style></head><body>
 
-<!-- 第一步：网页密码，全黑居中登录框 -->
+<!-- 第一步：网页账号 + 密码，全黑居中登录框 -->
 <div id="gate">
   <div class="login-box">
-    <p class="muted">请输入网页密码进入</p>
+    <p class="muted">请输入网页账号和密码进入</p>
+    <input id="webUser" type="text" placeholder="网页账号" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false">
     <input id="webPw" type="password" placeholder="网页密码" autocomplete="current-password">
     <button onclick="webLogin()">进入</button>
     <div id="gateError"></div>
   </div>
 </div>
 
-<!-- 通过网页密码后才显示 -->
+<!-- 通过网页账号密码后才显示 -->
 <div id="app" class="hidden">
 <div class="wrap">
 <div class="topbar">
@@ -173,11 +174,11 @@ a.kb-btn{display:block}
   <span><button id="logoutBtn" class="hidden" onclick="logout()">退出账号</button><button onclick="webLogout()">退出网页登录</button></span>
 </div>
 
-<!-- 网页密码通过后，先进入这个检查页，再决定去登录页还是频道页 -->
+<!-- 网页账号密码通过后，先进入这个检查页，再决定去登录页还是频道页 -->
 <div id="checkingView" class="hidden">
   <section>
   <h2>正在检查账号登录状态…</h2>
-  <p class="muted">网页密码已通过，正在确认账号有没有登录。</p>
+  <p class="muted">网页账号密码已通过，正在确认账号有没有登录。</p>
   </section>
 </div>
 
@@ -386,7 +387,7 @@ async function api(path, opts={}) {
   const r = await fetch(WEB_BASE + path, {credentials:'same-origin', headers:{'Content-Type':'application/json'}, ...opts});
   if (r.status === 401) {
     const d = await r.json().catch(()=>({}));
-    if (d.detail === 'need_web_auth') { showGate(); throw new Error('需要先输入网页密码'); }
+    if (d.detail === 'need_web_auth') { showGate(); throw new Error('需要先输入网页账号密码'); }
     throw new Error(d.detail || '未登录账号');
   }
   const d = await r.json().catch(()=>({}));
@@ -715,17 +716,26 @@ async function jumpToChatMessage(msgId){
   return false;
 }
 async function webLogin(){
+  const user = document.getElementById('webUser').value.trim();
   const pw = document.getElementById('webPw').value;
   const err = document.getElementById('gateError');
   err.textContent = '';
   try{
-    await api('/api/web-login',{method:'POST',body:JSON.stringify({password:pw})});
-    // 输入网页密码后先检查账号登录：没登录就停在登录页并提示登录
+    // 账号没设的老服务器：账号留空、只填密码就能进，和以前一样
+    await api('/api/web-login',{method:'POST',body:JSON.stringify({username:user, password:pw})});
+    // 通过网页账号密码后先检查账号登录：没登录就停在登录页并提示登录
     await refreshStatus();
   }catch(e){
-    err.textContent = e.message || '密码不对，请重试';
+    err.textContent = e.message || '账号或密码不对，请重试';
   }
 }
+document.getElementById('webUser').addEventListener('keydown', e=>{
+  if(e.key!=='Enter') return;
+  // 密码还空着就先跳到密码框，两个都填了才直接登录
+  const pw = document.getElementById('webPw');
+  if (!pw.value) { e.preventDefault(); pw.focus(); return; }
+  webLogin();
+});
 document.getElementById('webPw').addEventListener('keydown', e=>{ if(e.key==='Enter') webLogin(); });
 function showLoginStep(n){
   ['loginStep1','loginStep2','loginStep3'].forEach((id,i)=>{
@@ -745,7 +755,7 @@ function backToPhone(){
   const p = document.getElementById('phone'); if (p) p.focus();
 }
 async function refreshStatus(){
-  // 网页密码通过后，先进入检查页
+  // 网页账号密码通过后，先进入检查页
   showApp();
   showView('checkingView');
   try{
@@ -771,7 +781,7 @@ async function refreshStatus(){
       loadChannels();
     }
   }catch(e){
-    if (e.message !== '需要先输入网页密码') {
+    if (e.message !== '需要先输入网页账号密码') {
       document.getElementById('status').textContent = e.message;
       showView('loginView');
       showLoginStep(1);

@@ -15,6 +15,7 @@ services:
       TG_API_ID: "${TG_API_ID}"
       TG_API_HASH: "${TG_API_HASH}"
       TG_SESSION: "data/tg.session"
+      WEB_USERNAME: "${WEB_USERNAME:-}"
       WEB_PASSWORD: "${WEB_PASSWORD:-}"
       WEB_PATH: "${WEB_PATH:-}"
       WEB_PATH_ENABLED: "${WEB_PATH_ENABLED:-1}"

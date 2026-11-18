@@ -30,7 +30,8 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y git curl ca-certificates openssl
+# python3：tg 改写 .env、校验密码、随机生成账号密码都要用（docker 镜像里有 python，宿主机上也要有）
+apt-get install -y git curl ca-certificates openssl python3
 if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
@@ -103,11 +104,51 @@ if [ "$DIR" != "/root/telegram-stream" ]; then
   echo "注意：tg 默认目录是 /root/telegram-stream，你装在 $DIR，请用 TG_APP_DIR=$DIR tg"
 fi
 
+# ---------- 网页账号 / 密码：随机生成 ----------
+# 和 tg 里的 gen_auth_value 一模一样（改一处就要同步另一处，tests/test_web_auth.py 会直接比对函数体）。
+# 12-24 位，数字 / 小写 / 大写 / 特殊符号各至少一个；
+# 符号只用 .env 里安全、手机键盘好打的 !@%^&*-_=+.,:?~——
+# docker compose 解析无引号的 .env 会把 $ # ' " \ 和空白认错，写进去和实际值就不一致了。
+gen_auth_value() {
+  python3 - << 'PY'
+import secrets
+SYMBOLS = "!@%^&*-_=+.,:?~"
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DIGITS = "0123456789"
+ALL = LOWER + UPPER + DIGITS + SYMBOLS
+n = 12 + secrets.randbelow(13)          # 12..24 位，每次都不一样
+chars = [secrets.choice(LOWER), secrets.choice(UPPER), secrets.choice(DIGITS), secrets.choice(SYMBOLS)]
+chars += [secrets.choice(ALL) for _ in range(n - 4)]
+secrets.SystemRandom().shuffle(chars)   # 四类必选位不能固定排在前四位
+print("".join(chars))
+PY
+}
+
+# 手工输入的账号/密码里有没有 .env 认错的字符（$ # ' " \ 和空白）；有就返回 0。
+_bad_env_char() {
+  python3 -c 'import sys; v=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in v for c in bad) or any(c.isspace() for c in v) else 1)' "$1"
+}
+
+# 各退出分支统一打印刚生成的账号密码（或提示去 tg show-auth 看已有值）
+_show_new_auth() {
+  if [ "$NEW_ENV" = "1" ]; then
+    if [ -n "$NEW_USER" ]; then echo "网页账号（刚生成的，请记下来）：$NEW_USER"; else echo "网页账号：用你刚才填的那个（忘了就用 tg show-auth 查看）。"; fi
+    if [ -n "$NEW_PW" ]; then echo "网页密码（刚生成的，请记下来）：$NEW_PW"; else echo "网页密码：用你刚才填的那个（忘了就用 tg show-auth 查看）。"; fi
+  else
+    echo "网页账号密码：已有 .env 的不变，用 tg show-auth 在服务器终端查看。"
+  fi
+}
+
 # .env：已有就不动，没有就新建
+NEW_ENV=0
 NEW_PW=""
+NEW_USER=""
 if [ ! -f "$DIR/.env" ]; then
+  NEW_ENV=1
   API_ID="${TG_API_ID:-}"
   API_HASH="${TG_API_HASH:-}"
+  WEB_USER="${WEB_USERNAME:-}"
   WEB_PW="${WEB_PASSWORD:-}"
   if [ -t 0 ] && [ -z "$API_ID" ]; then
     read -r -p "api_id（纯数字，回车跳过，装完再用 tg set-id 补）： " API_ID || true
@@ -116,26 +157,44 @@ if [ ! -f "$DIR/.env" ]; then
     read -r -s -p "api_hash（输入不显示，回车跳过，装完再用 tg set-hash 补）： " API_HASH || true
     echo ""
   fi
+  if [ -t 0 ] && [ -z "$WEB_USER" ]; then
+    read -r -p "网页账号（回车自动生成 12-24 位随机账号）： " WEB_USER || true
+  fi
   if [ -t 0 ] && [ -z "$WEB_PW" ]; then
-    read -r -s -p "网页密码（输入不显示，回车自动生成一个）： " WEB_PW || true
+    read -r -s -p "网页密码（输入不显示，回车自动生成 12-24 位随机密码）： " WEB_PW || true
     echo ""
   fi
   if [ -z "$API_ID" ]; then API_ID="0"; fi
   if [ -z "$API_HASH" ]; then API_HASH="placeholder"; fi
+  if [ -n "$WEB_USER" ] && _bad_env_char "$WEB_USER"; then
+    echo "提供的网页账号含美元符、井号、引号、空格或反斜杠，.env 会被 docker compose 认错，已改成自动生成的安全账号。"
+    WEB_USER=""
+  fi
+  if [ -z "$WEB_USER" ]; then
+    WEB_USER="$(gen_auth_value)"
+    if [ -z "$WEB_USER" ]; then echo "生成随机网页账号失败（检查 python3 是否可用）。"; exit 1; fi
+    NEW_USER="$WEB_USER"
+  fi
   if [ -z "$WEB_PW" ]; then
-    WEB_PW="$(openssl rand -hex 8)"
+    WEB_PW="$(gen_auth_value)"
+    if [ -z "$WEB_PW" ]; then echo "生成随机网页密码失败（检查 python3 是否可用）。"; exit 1; fi
     NEW_PW="$WEB_PW"
-  elif python3 -c 'import sys; pw=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in pw for c in bad) or any(c.isspace() for c in pw) else 1)' "$WEB_PW"; then
+  elif _bad_env_char "$WEB_PW"; then
     echo "提供的网页密码含美元符、井号、引号、空格或反斜杠，.env 会被 docker compose 认错，已改成自动生成的安全密码。"
-    WEB_PW="$(openssl rand -hex 8)"
+    WEB_PW="$(gen_auth_value)"
+    if [ -z "$WEB_PW" ]; then echo "生成随机网页密码失败（检查 python3 是否可用）。"; exit 1; fi
     NEW_PW="$WEB_PW"
   fi
   WEB_PATH="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
   if [ "${#WEB_PATH}" != "24" ]; then WEB_PATH="$(openssl rand -hex 12)"; fi
-  printf 'TG_API_ID=%s\nTG_API_HASH=%s\nWEB_PASSWORD=%s\nWEB_PATH=%s\n' "$API_ID" "$API_HASH" "$WEB_PW" "$WEB_PATH" > "$DIR/.env"
+  printf 'TG_API_ID=%s\nTG_API_HASH=%s\nWEB_USERNAME=%s\nWEB_PASSWORD=%s\nWEB_PATH=%s\n' "$API_ID" "$API_HASH" "$WEB_USER" "$WEB_PW" "$WEB_PATH" > "$DIR/.env"
   chmod 600 "$DIR/.env"
 else
   echo "已有 .env，保留不动，改配置用 tg 命令。"
+  # 老版本升级上来的 .env 里只有 WEB_PASSWORD：不用改也能继续用（登录页账号留空），只提醒一句
+  if grep -q '^WEB_PASSWORD=' "$DIR/.env" 2>/dev/null && ! grep -q '^WEB_USERNAME=' "$DIR/.env" 2>/dev/null; then
+    echo "提示：新版支持网页账号。你现在只设了密码——登录页账号留空、只填密码就能进；想加个账号就运行 tg reset-auth（直接回车会自动生成）。"
+  fi
   if ! grep -q "^WEB_PATH=" "$DIR/.env" 2>/dev/null; then
     _NP="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
     if [ "${#_NP}" = "24" ]; then
@@ -197,11 +256,7 @@ for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
 done
 if [ "$_HAS_HTTPS" = "1" ]; then
   echo "检测到已有 HTTPS 站点，保留不动，继续用原来的 https 地址访问。"
-  if [ -n "$NEW_PW" ]; then
-    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
-  else
-    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
-  fi
+  _show_new_auth
   exit 0
 fi
 if ! command -v nginx >/dev/null 2>&1; then
@@ -224,11 +279,7 @@ if [ -z "$BIND_NAME" ]; then
       if [ -f "$d/fullchain.pem" ] && [ -f "$d/privkey.pem" ]; then echo "  $(basename "$d")"; fi
     done 2>/dev/null || true
   fi
-  if [ -n "$NEW_PW" ]; then
-    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
-  else
-    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
-  fi
+  _show_new_auth
   exit 1
 fi
 if [ -f "/root/cert/$BIND_NAME/fullchain.pem" ] && [ -f "/root/cert/$BIND_NAME/privkey.pem" ]; then
@@ -239,11 +290,7 @@ else
   echo ""
   echo "域名/IP $BIND_NAME 的证书不存在：/root/cert/$BIND_NAME/ 或 /etc/nginx/cert/$BIND_NAME/ 里要有 fullchain.pem 和 privkey.pem。"
   echo "安装不会提供 HTTP 访问。请准备好证书后运行 tg domain $BIND_NAME 绑定（tg domain 还能用泛域名/父域名证书），再用 https://$BIND_NAME/<访问路径> 访问（路径用 tg show-path 查看）。"
-  if [ -n "$NEW_PW" ]; then
-    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
-  else
-    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
-  fi
+  _show_new_auth
   exit 1
 fi
 if /usr/local/bin/tg-domain "$BIND_NAME"; then
@@ -255,11 +302,7 @@ if /usr/local/bin/tg-domain "$BIND_NAME"; then
   else
     echo "访问地址：https://$BIND_NAME"
   fi
-  if [ -n "$NEW_PW" ]; then
-    echo "网页密码（刚生成的，请记下来）：$NEW_PW"
-  else
-    echo "网页密码：已有 .env 的不变，用 tg show-password 在服务器终端查看。"
-  fi
+  _show_new_auth
 else
   echo "绑定 $BIND_NAME 失败，外部访问未开通，不提供 HTTP 访问。"
   exit 1

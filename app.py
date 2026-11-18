@@ -30,6 +30,9 @@ API_ID = int(os.environ.get("TG_API_ID", "0") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_PATH = os.environ.get("TG_SESSION", "data/tg.session")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+# 网页账号（可选）：不设就一直兼容老版——登录页账号框留空、只验密码；
+# 设了就必须账号和密码同时对。strip 一下：.env 里不小心带了回车/空格也不会把登录锁死。
+WEB_USERNAME = os.environ.get("WEB_USERNAME", "").strip()
 WEB_PATH = os.environ.get("WEB_PATH", "").strip().strip("/")
 # 访问路径开关（tg path-on / tg path-off），默认开启。关闭时路径值仍保留在 .env，重新开启还是原来的地址。
 if os.environ.get("WEB_PATH_ENABLED", "1").strip().lower() in ("0", "false", "off", "no"):
@@ -62,7 +65,7 @@ if ENC_MODE not in ("auto", "strict", "off"):
     ENC_MODE = "strict"
 # 密钥根：可用环境变量 TG_BLOB_SECRET 固定（多实例/重启后想保持同一把密钥时用），
 # 不设就是每次启动随机生成 32 字节——只存在进程内存里，不写磁盘、不进仓库。
-# 网页密码的会话本来也是内存里的，重启后所有人要重新登录，密钥跟着换没有额外代价。
+# 网页账号密码的会话本来也是内存里的，重启后所有人要重新登录，密钥跟着换没有额外代价。
 _ENC_SECRET = (os.environ.get("TG_BLOB_SECRET", "") or "").encode() or secrets.token_bytes(32)
 
 
@@ -75,14 +78,14 @@ def _clamp_parallel(v):
 
 
 # 并行下载数：全局设置，默认 2，tg set-parallel 最多改到 4（再多容易 FloodWait）。
-# 读启动时的环境变量，改完要重启容器才生效，和 WEB_PASSWORD / WEB_PATH 一样。
+# 读启动时的环境变量，改完要重启容器才生效，和 WEB_USERNAME / WEB_PASSWORD / WEB_PATH 一样。
 PARALLEL = _clamp_parallel(os.environ.get("TG_PARALLEL", "2"))
 # 全局并发下载任务封顶也是 4：一个视频用满 4 个时，别的视频要等当前窗口放出名额，
 # 避免多个视频同时播时总并发超标。缩略图/图片是小文件单次下载，不占这个名额，否则 30 张图会把视频饿死。
 _download_sem = asyncio.Semaphore(4)
 _web_sessions: dict = {}  # token -> expiry timestamp，cookie 本身不再是密码的哈希，泄露也推不出密码
 _web_attempts: dict = {}  # ip -> [失败时间戳]，10 分钟内 5 次失败就限流 10 分钟
-# Telegram 登录限流，和网页密码限流分开记：发验证码、验证码、二次密码各算一次，
+# Telegram 登录限流，和网页账号密码限流分开记：发验证码、验证码、二次密码各算一次，
 # 成功发码不算“清零”（否则反复发码就能绕开验证码爆破计数），只有整套登录成功才清。
 _tg_attempts: dict = {}  # ip -> [失败时间戳]
 
@@ -259,7 +262,9 @@ def _clear_login_state():
 
 def check_web_auth(request: Request):
     if not WEB_PASSWORD:
-        raise HTTPException(status_code=401, detail="need_web_auth")
+        # 没设密码等于不设防：所有接口都不放行。文案直接告诉运维去 tg reset-auth 设账号密码。
+        raise HTTPException(status_code=401, detail="网页账号密码未设置，请在服务器上用 tg reset-auth 设置")
+    # 下面这个 need_web_auth 是前端认的协议标识（看到它就把登录框弹出来），不要改。
     token = request.cookies.get("web_token")
     exp = _web_sessions.get(token) if token else None
     if exp is None or exp < time.time():
@@ -325,15 +330,16 @@ async def require_login() -> TelegramClient:
     return client
 
 
-# ---------- 网页密码 ----------
+# ---------- 网页账号 + 密码 ----------
 class WebLoginIn(BaseModel):
-    password: str
+    username: str = ""
+    password: str = ""
 
 
 @app.post("/api/web-login")
 async def web_login(request: Request, body: WebLoginIn):
     if not WEB_PASSWORD:
-        raise HTTPException(status_code=401, detail="网页密码未设置，请在服务器上用 tg reset-password 设置一个")
+        raise HTTPException(status_code=401, detail="网页账号密码未设置，请在服务器上用 tg reset-auth 设置")
     ip = _client_ip(request)
     now = time.time()
     # 失败记录加上限：先清掉过期/空的，超过 1000 个 IP 就删掉最旧的一半，防止伪造 IP 撑大字典耗内存
@@ -358,10 +364,21 @@ async def web_login(request: Request, body: WebLoginIn):
     attempts = _web_attempts.get(ip, [])
     if len(attempts) >= 5:
         raise HTTPException(status_code=429, detail="尝试太多次，请 10 分钟后再试")
-    if not secrets.compare_digest(body.password or "", WEB_PASSWORD):
+    # 密码一定要比；账号只在设了 WEB_USERNAME 时比。
+    # 比的是 UTF-8 字节：secrets.compare_digest 传 str 时只支持 ASCII，
+    # 中文账号/密码会直接抛异常变成 500，先 encode 就都不会了。
+    ok_p = secrets.compare_digest((body.password or "").encode("utf-8"), WEB_PASSWORD.encode("utf-8"))
+    if WEB_USERNAME:
+        ok_u = secrets.compare_digest((body.username or "").encode("utf-8"), WEB_USERNAME.encode("utf-8"))
+    else:
+        # 兼容旧版：刚 tg update 上来、.env 里还没有 WEB_USERNAME 的老用户，
+        # 登录页账号框留空就能进，不会被升级锁在门外。
+        ok_u = not (body.username or "")
+    # 按位与汇总，两项都比完才判断：不让人从响应快慢看出是账号错还是密码错。
+    if not (ok_u & ok_p):
         attempts.append(now)
         _web_attempts[ip] = attempts
-        raise HTTPException(status_code=401, detail="网页密码不对")
+        raise HTTPException(status_code=401, detail="网页账号或密码不对")
     _web_attempts.pop(ip, None)
     token = secrets.token_urlsafe(32)
     _web_sessions[token] = now + WEB_SESSION_DAYS * 24 * 3600
@@ -502,7 +519,7 @@ class LogoutIn(BaseModel):
 
 # 退出账号的 api_id 校验：输错 1 次就锁 10 分钟。锁是全局的，不按 IP：
 # 按 IP 锁的话换个 IP（代理、隧道）就能接着猜；全局锁最多让自己 10 分钟内退不了，
-# 退出本来就是很少用的操作，可以接受。和网页密码、Telegram 登录的限流互不影响。
+# 退出本来就是很少用的操作，可以接受。和网页账号密码、Telegram 登录的限流互不影响。
 LOGOUT_LOCK_SECONDS = 600
 _logout_locked_until = 0.0
 
@@ -510,7 +527,7 @@ _logout_locked_until = 0.0
 @app.post("/api/logout")
 async def logout(request: Request, body: LogoutIn):
     # 退出 Telegram 账号会让服务器上的 session 作废，要重新收验证码登录，
-    # 所以必须输入正确的 api_id 才能退出，防止误点或别人拿到网页密码后直接把账号踢掉。
+    # 所以必须输入正确的 api_id 才能退出，防止误点或别人拿到网页账号密码后直接把账号踢掉。
     global _logout_locked_until
     check_web_auth(request)
     given = (body.api_id or "").strip()

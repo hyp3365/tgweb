@@ -6,8 +6,8 @@
 #   tg set-id 12345   设置 api_id
 #   tg set-hash xxx   设置 api_hash
 #   tg del            删除 api 配置（清空 api_id / api_hash）
-#   tg reset-password [新密码]  重置网页密码（不给参数就交互输入）
-#   tg show-password  查看当前网页密码（只在服务器终端显示，不要发到聊天里）
+#   tg reset-auth [user|password|both] [新值]  重置网页账号/密码（不传参数进选择菜单；新值留空就随机生成 12-24 位）
+#   tg show-auth     查看当前网页账号和密码（只在服务器终端显示，不要发到聊天里）
 #   tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字路径）
 #   tg show-path      查看当前访问路径和完整地址（只在服务器终端显示）
 #   tg set-parallel [1-4]  设置并行下载数（默认 2，最大 4）
@@ -61,6 +61,33 @@ with open(path, "w") as f:
     f.write("\n".join(out) + "\n")
 os.chmod(path, 0o600)
 PY
+}
+
+# ---------- 网页账号 / 密码：随机生成 ----------
+# 这两样要在手机登录页上手打，所以生成规则定死：12-24 位，数字 / 小写 / 大写 / 特殊符号各至少一个。
+# 特殊符号只从 !@%^&*-_=+.,:?~ 里取：docker compose 解析无引号的 .env 时会把
+# $ # ' " \ 和空白认错，导致容器里拿到的和显示的不一样；剩下这几个既安全，手机键盘也好打。
+# install.sh 里有同名同内容的函数：两边必须一字不差，改一处就要同步另一处
+#（tests/test_web_auth.py 会直接比对两边的函数体）。
+gen_auth_value() {
+  python3 - << 'PY'
+import secrets
+SYMBOLS = "!@%^&*-_=+.,:?~"
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DIGITS = "0123456789"
+ALL = LOWER + UPPER + DIGITS + SYMBOLS
+n = 12 + secrets.randbelow(13)          # 12..24 位，每次都不一样
+chars = [secrets.choice(LOWER), secrets.choice(UPPER), secrets.choice(DIGITS), secrets.choice(SYMBOLS)]
+chars += [secrets.choice(ALL) for _ in range(n - 4)]
+secrets.SystemRandom().shuffle(chars)   # 四类必选位不能固定排在前四位
+print("".join(chars))
+PY
+}
+
+# 手工输入的账号/密码里有没有 .env 认错的字符（$ # ' " \ 和空白）；有就返回 0。
+_bad_env_char() {
+  python3 -c 'import sys; v=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in v for c in bad) or any(c.isspace() for c in v) else 1)' "$1"
 }
 
 mask_hash() {
@@ -129,6 +156,16 @@ show_status() {
     echo "并行下载数：2（默认）"
   else
     echo "并行下载数：$par"
+  fi
+  local _wu _wpw
+  _wu="$(get_val WEB_USERNAME)"
+  _wpw="$(get_val WEB_PASSWORD)"
+  if [ -z "$_wpw" ]; then
+    echo "网页登录：未设置（用 tg reset-auth 设置账号密码）"
+  elif [ -z "$_wu" ]; then
+    echo "网页登录：只设了密码（登录页账号留空即可；用 tg reset-auth 加一个账号）"
+  else
+    echo "网页登录：账号已设置（密码用 tg show-auth 查看）"
   fi
   if [ -f "$APP_DIR/data/tg.session" ]; then
     echo "登录 session：已存在（data/tg.session）"
@@ -213,6 +250,11 @@ do_update() {
   fi
   if [ -f "$APP_DIR/tg-domain.sh" ]; then
     cp "$APP_DIR/tg-domain.sh" /tmp/tg-domain.new && chmod +x /tmp/tg-domain.new && mv /tmp/tg-domain.new /usr/local/bin/tg-domain 2>/dev/null || echo "注意：/usr/local/bin/tg-domain 没更新成功，请手动拷 $APP_DIR/tg-domain.sh 过去。"
+  fi
+  # 升级上来的老用户 .env 里只有 WEB_PASSWORD、没有 WEB_USERNAME：不用做任何事就能继续用
+  # （登录页账号留空），这里只温和提醒一句可以加个账号，不去改 .env、不强制重启。
+  if [ -f "$ENV_FILE" ] && [ -n "$(get_val WEB_PASSWORD)" ] && [ -z "$(get_val WEB_USERNAME)" ]; then
+    echo "提示：新版支持网页账号，你现在只设了密码——登录页账号留空、只填密码就能进；想加个账号就运行 tg reset-auth（直接回车会自动生成）。"
   fi
   if [ -n "$TG_NO_RESTART" ]; then
     echo "（测试模式，跳过重建）"
@@ -388,48 +430,157 @@ do_reset_web_path() {
   restart_service
 }
 
-show_web_password() {
-  local pw
+show_web_auth() {
+  local user pw
+  user="$(get_val WEB_USERNAME)"
   pw="$(get_val WEB_PASSWORD)"
+  if [ -z "$user" ]; then
+    echo "网页账号：未设置（登录页账号留空、只填密码就能进；用 tg reset-auth 生成或设置一个账号）"
+  else
+    echo "网页账号：$user"
+  fi
   if [ -z "$pw" ]; then
-    echo "网页密码：未设置（任何人打开页面都不用密码，强烈建议用 tg reset-password 设一个）。"
+    echo "网页密码：未设置（任何人打开页面都不用登录，强烈建议用 tg reset-auth 设一个）。"
   else
     echo "网页密码：$pw"
-    echo "注意：这个密码只在服务器终端里显示，不要发到聊天里、不要截图发给别人。"
+    if [ -z "$user" ]; then
+      echo "（还没设账号，登录页账号留空即可；想加账号用 tg reset-auth）"
+    fi
+    echo "注意：账号和密码只在服务器终端里显示，不要发到聊天里、不要截图发给别人。"
   fi
 }
 
-do_reset_web_password() {
-  local pw="$1"
-  local from_arg=0
-  if [ -n "$pw" ]; then from_arg=1; fi
-  if [ -z "$pw" ]; then
-    read -r -s -p "新网页密码（输入时不显示）： " pw
-    echo ""
-    read -r -s -p "再输一次确认： " pw2
-    echo ""
-    if [ -z "$pw" ]; then
-      echo "密码不能为空，已取消。"
-      return 1
-    fi
-    if [ "$pw" != "$pw2" ]; then
-      echo "两次输入不一致，已取消。"
-      return 1
-    fi
+# 写入账号：$1=新账号（空=随机生成） $2=1 表示来自命令行参数。只改 WEB_USERNAME，不动密码。
+_apply_web_username() {
+  local user="$1" from_arg="${2:-0}" gen=0
+  if [ -z "$user" ]; then
+    user="$(gen_auth_value)"
+    gen=1
   fi
-  if python3 -c 'import sys; pw=sys.argv[1]; bad=[chr(36),chr(35),chr(39),chr(34),chr(92)]; sys.exit(0 if any(c in pw for c in bad) or any(c.isspace() for c in pw) else 1)' "$pw"; then
-    echo "密码不能含美元符、井号、单引号、双引号、空格、反斜杠，否则 .env 会被 docker compose 认错，导致实际密码和显示的不一样。请换一个不含这些字符的密码。"
+  if [ -z "$user" ]; then
+    echo "生成随机账号失败，请重试。"
     return 1
   fi
-  if [ "${#pw}" -lt 12 ]; then
-    echo "注意：这个密码不到 12 位，很容易被猜到。建议用安装时自动生成的 16 位随机密码，或者重新设一个长的。"
+  if _bad_env_char "$user"; then
+    echo "账号不能含美元符、井号、单引号、双引号、空格、反斜杠，否则 .env 会被 docker compose 认错，导致实际账号和显示的不一样。请换一个不含这些字符的账号。"
+    return 1
+  fi
+  if [ "$from_arg" = "1" ]; then
+    echo "注意：命令行里写的账号会留在 shell 历史里，下次请不带参数交互输入。"
+  fi
+  set_val WEB_USERNAME "$user"
+  if [ "$gen" = "1" ]; then
+    echo "网页账号（随机生成 12-24 位，请记下来）：$user"
+  else
+    echo "网页账号已保存：$user"
+  fi
+  WEB_AUTH_CHANGED=1
+}
+
+# 写入密码：$1=新密码（空=随机生成） $2=1 表示来自命令行参数。只改 WEB_PASSWORD，不动账号。
+_apply_web_password() {
+  local pw="$1" from_arg="${2:-0}" gen=0
+  if [ -z "$pw" ]; then
+    pw="$(gen_auth_value)"
+    gen=1
+  fi
+  if [ -z "$pw" ]; then
+    echo "生成随机密码失败，请重试。"
+    return 1
+  fi
+  if _bad_env_char "$pw"; then
+    echo "密码不能含美元符、井号、单引号、双引号、空格、反斜杠，否则 .env 会被 docker compose 认错，导致实际密码和显示的不一样。请换一个不含这些字符的密码。"
+    return 1
   fi
   if [ "$from_arg" = "1" ]; then
     echo "注意：命令行里写的密码会留在 shell 历史里，下次请不带参数交互输入。"
   fi
+  if [ "$gen" = "0" ] && [ "${#pw}" -lt 12 ]; then
+    echo "注意：这个密码不到 12 位，很容易被猜到。建议直接回车，让它随机生成 12-24 位。"
+  fi
   set_val WEB_PASSWORD "$pw"
-  echo "网页密码已重置。"
-  echo "注意：旧的网页登录 Cookie 会失效，浏览器里要重新输新密码才能进。"
+  if [ "$gen" = "1" ]; then
+    echo "网页密码（随机生成 12-24 位，请记下来）：$pw"
+  else
+    echo "网页密码已保存。"
+  fi
+  WEB_AUTH_CHANGED=1
+}
+
+# 交互取新账号：可回显（方便核对），直接回车=随机生成。
+_prompt_web_username() {
+  local user=""
+  read -r -p "新网页账号（直接回车随机生成 12-24 位）： " user || true
+  _apply_web_username "$user" 0
+}
+
+# 交互取新密码：输入不回显；直接回车=随机生成，跳过二次确认。
+_prompt_web_password() {
+  local pw="" pw2=""
+  read -r -s -p "新网页密码（输入不显示，直接回车随机生成 12-24 位）： " pw || true
+  echo ""
+  if [ -z "$pw" ]; then
+    _apply_web_password "" 0
+    return
+  fi
+  read -r -s -p "再输一次确认： " pw2 || true
+  echo ""
+  if [ "$pw" != "$pw2" ]; then
+    echo "两次输入不一致，已取消。"
+    return 1
+  fi
+  _apply_web_password "$pw" 0
+}
+
+# 重置网页账号 / 密码：
+#   tg reset-auth                  进选择：只改账号 / 只改密码 / 两者都改
+#   tg reset-auth user [新账号]     只改账号（不带新账号就交互输入，直接回车随机生成）
+#   tg reset-auth password [新密码] 只改密码（同上）
+#   tg reset-auth both             账号和密码依次改，最后只重启一次
+# 旧的 tg reset-password / reset-pw 仍然可用：带一个参数就按“只改密码”处理，不带参数进选择菜单。
+do_reset_web_auth() {
+  local what="${1:-}" value="${2:-}" from_arg=0
+  if [ -n "$value" ]; then from_arg=1; fi
+  if [ -z "$what" ]; then
+    echo "要重置什么？"
+    echo "  1) 只重置账号"
+    echo "  2) 只重置密码"
+    echo "  3) 账号和密码一起重置"
+    echo "  0) 取消"
+    read -r -p "选一个 [0-3]： " what || true
+  fi
+  case "$what" in
+    1|user|username|account) what="user" ;;
+    2|password|passwd|pw) what="password" ;;
+    3|both|all) what="both" ;;
+    0|cancel|"") echo "已取消。"; return 1 ;;
+    *) echo "没有这个选项，已取消。"; return 1 ;;
+  esac
+  WEB_AUTH_CHANGED=0
+  if [ "$what" = "both" ]; then
+    if [ "$from_arg" = "1" ]; then
+      echo "一起重置时逐项输入：账号可回显、密码不回显，直接回车都是随机生成。"
+    fi
+    _prompt_web_username || return 1
+    _prompt_web_password || return 1
+  elif [ "$what" = "user" ]; then
+    if [ "$from_arg" = "1" ]; then
+      _apply_web_username "$value" 1 || return 1
+    else
+      _prompt_web_username || return 1
+    fi
+  else
+    if [ "$from_arg" = "1" ]; then
+      _apply_web_password "$value" 1 || return 1
+    else
+      _prompt_web_password || return 1
+    fi
+  fi
+  if [ "$WEB_AUTH_CHANGED" != "1" ]; then
+    echo "没有改动。"
+    return 1
+  fi
+  echo "注意：旧的网页登录 Cookie 会失效，浏览器里要重新输入新的账号和密码才能进。"
   restart_service
 }
 
@@ -686,8 +837,9 @@ show_help() {
   echo "  tg set-id 12345 设置 api_id"
   echo "  tg set-hash xxx 设置 api_hash"
   echo "  tg del          删除 api 配置"
-  echo "  tg reset-password [新密码]  重置网页密码"
-  echo "  tg show-password  查看当前网页密码"
+  echo "  tg reset-auth [user|password|both] [新值]  重置网页账号/密码（不传参数进选择菜单；新值留空就随机生成 12-24 位）"
+  echo "  tg show-auth      查看当前网页账号和密码"
+  echo "  （旧的 tg reset-password / tg show-password 仍然可用）"
   echo "  tg reset-path [路径]  重置访问路径（不给参数就自动生成24位字母数字）"
   echo "  tg show-path      查看当前访问路径和完整地址"
   echo "  tg path-on        开启访问路径（默认开启）"
@@ -718,8 +870,8 @@ menu() {
     echo "1) 设置 api_id"
     echo "2) 设置 api_hash"
     echo "3) 删除 api 配置"
-    echo "4) 重置网页密码"
-    echo "5) 查看网页密码"
+    echo "4) 重置账号密码"
+    echo "5) 查看账号密码"
     echo "6) 重启服务"
     echo "7) 绑定/更换域名"
     echo "8) 卸载（全部删除）"
@@ -755,10 +907,10 @@ menu() {
         fi
         ;;
       4)
-        do_reset_web_password ""
+        do_reset_web_auth ""
         ;;
       5)
-        show_web_password
+        show_web_auth
         ;;
       6)
         restart_service
@@ -821,8 +973,11 @@ case "${1:-}" in
   set-id) do_set_id "${2:-}" ;;
   set-hash) if [ -n "${2:-}" ]; then echo "注意：命令行里写的密钥会留在 shell 历史里，下次请不带参数交互输入。"; fi; do_set_hash "${2:-}" ;;
   del) do_del ;;
-  reset-password|reset-pw) do_reset_web_password "${2:-}" ;;
-  show-password|view-password|show-pw|view-pw) show_web_password ;;
+  reset-auth|reset-account) do_reset_web_auth "${2:-}" "${3:-}" ;;
+  show-auth|show-account) show_web_auth ;;
+  # 旧别名：带一个新密码就按“只改密码”处理，不带参数进选择菜单
+  reset-password|reset-pw) if [ -n "${2:-}" ]; then do_reset_web_auth password "${2}"; else do_reset_web_auth; fi ;;
+  show-password|view-password|show-pw|view-pw) show_web_auth ;;
   reset-path) do_reset_web_path "${2:-}" ;;
   show-path|view-path|show-p) show_web_path ;;
   path-on|enable-path) do_path_on ;;
