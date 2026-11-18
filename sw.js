@@ -377,6 +377,11 @@ async function buildMediaResponse(opts) {
         if (r.done) controller.close();
         else controller.enqueue(r.value);
       } catch (e) {
+        // 读流中途出的错（上游断流、502/524 被拦成 HTML、帧长异常、服务端重启…）
+        // 必须报给页面，否则角标上只剩“🔒 加密传输”，看不出到底哪一层挂了。
+        // 用户拖进度条 / 关播放器导致的 abort 不算错误，绝不能拿它去覆盖角标。
+        const aborted = (e && e.code === 'abort') || !!(ctx.signal && ctx.signal.aborted);
+        if (!aborted) notifyPage((e && e.code) || 'stream', (e && e.message) || String(e));
         try { controller.error(e); } catch (e2) { /* 流已经关掉了 */ }
       }
     },
@@ -446,6 +451,11 @@ async function handleMedia(request) {
   } catch (e) {
     // 没登录就不再往下走：页面自己的 /api 调用会 401 并弹密码框
     if (e && e.code === 'auth') return new Response('', { status: 401 });
+    // 浏览器自己取消了这条响应（拖进度条、关播放器、读完 moov 就撒手）：
+    // 这是正常行为，不是“加密失败”，静默回一个 499 就行，绝不 notifyPage。
+    if (e && e.code === 'abort') {
+      return new Response('', { status: 499, headers: { 'X-Tgweb-Err': 'abort' } });
+    }
     const code = String((e && e.code) || 'err');
     const message = String((e && e.message) || e);
     notifyPage(code, message);

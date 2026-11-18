@@ -1989,8 +1989,9 @@ const SW_WAIT_MS = 2500;      // SW 初始化（register + ready + 接管）的�
 let encActive = false;        // 本次播放是不是走的加密流
 let encFallbackDone = false;
 let lastEncErr = '';          // SW 报上来的最近一次加密错误（页面角标上显示）
-let encWatchTimer = null;     // 起播超时保护定时器
+let encWatchTimer = null;     // 起播超时保护定时器（只盯初次起播，起播成功后永久作废）
 let encPlaySession = 0;       // 播放会话号：旧会话的超时器不能误伤新视频
+let encStarted = false;       // 本次播放是否已经真正起播过（解出首帧/开始播放）
 function updateEncBadge(note){
   const b = document.getElementById('encBadge');
   if (!b) return;
@@ -2007,6 +2008,37 @@ function showEncErr(){
 }
 function clearEncWatch(){
   if (encWatchTimer) { clearTimeout(encWatchTimer); encWatchTimer = null; }
+}
+// 起播超时保护：加密流有时候就是一条字节都解不出来（SW 被换掉、边缘节点把 POST
+// 拦成了 HTML、服务端重启…），<video> 又不会报错，就这么一直停在就绪态 0～1，
+// 屏上只有“🔒 加密传输”。等 15 秒还没解出可播帧：auto 模式自动回落明文，
+// strict 模式不再默默卡死，直接把 SW 报上来的原因贴到角标上。
+//
+// 这个定时器只盯“初次起播”：loadeddata / canplay / playing 一响就把 encStarted 置真
+// 并把它清掉，所以起播成功之后再拖进度条、再重新缓冲，都不会被它误伤。
+function armEncWatch(session){
+  clearEncWatch();
+  if (!encActive || encStarted) return;
+  if (session !== encPlaySession) return;
+  const p = document.getElementById('player');
+  if (!p) return;
+  if (document.getElementById('playerModal').classList.contains('hidden')) return;
+  if (p.readyState >= 2) return;
+  encWatchTimer = setTimeout(()=>{
+    encWatchTimer = null;
+    if (session !== encPlaySession) return;
+    if (!encActive || encStarted) return;
+    if (document.getElementById('playerModal').classList.contains('hidden')) return;
+    if (p.readyState >= 2) return;
+    if (STREAM_MODE === 'strict') { showEncErr(); return; }
+    const src = p.getAttribute('src') || '';
+    if (src.indexOf('/media/') < 0) { updateEncBadge(); return; }
+    encFallbackDone = true;
+    encActive = false;
+    p.src = src.replace('/media/', '/stream/');
+    p.play().catch(()=>{});
+    updateEncBadge('加密超时已回落');
+  }, 15000);
 }
 function initEncryptedStream(){
   // 没接管就播的话，/media/ 请求会真发到服务器（404），所以要么等它接管，要么走明文。
@@ -2075,6 +2107,8 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (ev)=>{
     const d = ev && ev.data;
     if (!d || d.type !== 'tgweb-enc-error') return;
+    // 拖进度条 / 关播放器时 SW 那条流是被浏览器取消的，不是故障：绝不能拿它覆盖角标。
+    if (d.code === 'abort') return;
     lastEncErr = (d.code ? '[' + d.code + '] ' : '') + (d.message || '');
     if (STREAM_MODE === 'strict' && encActive) showEncErr();
   });
@@ -2118,6 +2152,7 @@ async function playVideo(channelId, msgId){
   const q = currentChannelUsername ? `?username=${encodeURIComponent(currentChannelUsername)}` : '';
   encFallbackDone = false;
   lastEncErr = '';
+  encStarted = false;
   clearEncWatch();
   encPlaySession++;
   const session = encPlaySession;
@@ -2136,25 +2171,7 @@ async function playVideo(channelId, msgId){
   if (useEnc) {
     encActive = true;
     p.src = `${WEB_BASE}/media/${channelId}/${msgId}` + q;
-    // 起播超时保护：加密流有时候就是一条字节都解不出来（SW 被换掉、边缘节点把 POST
-    // 拦成了 HTML、服务端重启…），<video> 又不会报错，就这么一直停在就绪态 0～1，
-    // 屏上只有“🔒 加密传输”。等 15 秒还没解出可播帧：auto 模式自动回落明文，
-    // strict 模式不再默默卡死，直接把 SW 报上来的原因贴到角标上。
-    encWatchTimer = setTimeout(()=>{
-      encWatchTimer = null;
-      if (session !== encPlaySession) return;
-      if (!encActive) return;
-      if (document.getElementById('playerModal').classList.contains('hidden')) return;
-      if (p.readyState >= 2) return;
-      if (STREAM_MODE === 'strict') { showEncErr(); return; }
-      const src = p.getAttribute('src') || '';
-      if (src.indexOf('/media/') < 0) { updateEncBadge(); return; }
-      encFallbackDone = true;
-      encActive = false;
-      p.src = src.replace('/media/', '/stream/');
-      p.play().catch(()=>{});
-      updateEncBadge('加密超时已回落');
-    }, 15000);
+    armEncWatch(session);
   } else if (STREAM_MODE === 'strict') {
     encActive = false;
     p.removeAttribute('src'); p.load();
@@ -2171,6 +2188,27 @@ async function playVideo(channelId, msgId){
   updateEncBadge(fallbackNote);
   p.play().catch(()=>{});
 }
+// 起播成功（解出首帧 / 真的开始放了）：把起播超时器永久作废。
+// 起播后十几秒内拖进度条时，<video> 的 readyState 会短暂退回 1（HAVE_METADATA），
+// 少了这一条，那次正常的缓冲抖动正好撞上 15 秒定时器，就会被误报成“⚠ 加密失败”。
+function markEncStarted(){
+  if (!encActive) return;
+  const p = document.getElementById('player');
+  if (!p || p.readyState < 2) return;
+  encStarted = true;
+  clearEncWatch();
+  if (!lastEncErr) updateEncBadge();   // 角标保持在“🔒 加密传输”
+}
+['loadeddata', 'canplay', 'playing'].forEach(ev=>{
+  document.getElementById('player').addEventListener(ev, markEncStarted);
+});
+// 起播还没成功就拖动进度条：原来那 15 秒是从起播算起的，拖到新位置后可能只剩几秒，
+// 缓冲还没到可播态就被判死刑。这里按当前会话重新起算一次；
+// 一旦真的播起来（encStarted），后面怎么拖都不会再挂这个定时器。
+document.getElementById('player').addEventListener('seeking', ()=>{
+  if (!encActive || encStarted || !encWatchTimer) return;
+  armEncWatch(encPlaySession);
+});
 // 播放时先判断视频尺寸：元数据一到就看 videoHeight 和 videoWidth，
 // 高大于宽就是竖屏，给框加 portrait-video 类走贴底不动；横屏和正方形不加，
 // 保持原来往上抬半框的位置。元数据没到之前不判，默认横屏位置，不会闪一下贴底。
